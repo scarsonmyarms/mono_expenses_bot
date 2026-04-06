@@ -1,6 +1,7 @@
 from flask import Flask, request
 import requests
 from decouple import config
+import os
 
 app = Flask(__name__)
 
@@ -44,5 +45,6 @@ def mono_webhook():
 
 
 if __name__ == '__main__':
-    # Запускаем локальный сервер на порту 5000
-    app.run(port=5000)
+    # Сервер будет брать порт, который ему даст хостинг, или 5000 по умолчанию
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
