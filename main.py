@@ -11,6 +11,7 @@ app = Flask(__name__)
 BOT_TOKEN = config('BOT_TOKEN')
 CHAT_ID = config('CHAT_ID')
 MONO_TOKEN = config('MONO_TOKEN')
+WHITE_CARD_ID = config('WHITE_CARD_ID')
 
 # Базовый словарь категорий MCC (можно дополнять своими)
 MCC_CATEGORIES = {
@@ -42,7 +43,8 @@ def get_monthly_stats():
     to_time = int(now.timestamp())
 
     # 2. Делаем запрос (0 - это счет по умолчанию, черная карта)
-    url = f"https://api.monobank.ua/personal/statement/0/{from_time}/{to_time}"
+    # Вместо /0/ мы подставляем переменную {WHITE_CARD_ID}
+    url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_time}/{to_time}"
     headers = {"X-Token": MONO_TOKEN}
 
     response = requests.get(url, headers=headers)
