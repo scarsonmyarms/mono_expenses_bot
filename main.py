@@ -5,6 +5,7 @@ from decouple import config
 import time
 from datetime import datetime
 import json
+import threading
 
 app = Flask(__name__)
 
@@ -25,6 +26,11 @@ def send_to_telegram(text, chat_id=CHAT_ID):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     requests.post(url, json=payload)
 
+# Создаем отдельную функцию для фоновой работы
+def process_stats_background(chat_id):
+    send_to_telegram("⏳ Считаю траты за месяц...", chat_id)
+    stats_message = get_monthly_stats()
+    send_to_telegram(stats_message, chat_id)
 
 def get_monthly_stats():
     """Считает стату за месяц, используя загруженный датасет MCC кодов"""
@@ -98,26 +104,20 @@ def mono_webhook():
     return "OK", 200
 
 
-# --- НОВЫЙ РОУТ ДЛЯ ТЕЛЕГРАМА ---
-# В качестве адреса используем токен, чтобы никто чужой не угадал ссылку
 @app.route(f'/tg-{BOT_TOKEN}', methods=['POST'])
 def telegram_webhook():
     data = request.json
 
-    # Проверяем, что пришло текстовое сообщение
     if "message" in data and "text" in data["message"]:
         text = data["message"]["text"]
         chat_id = data["message"]["chat"]["id"]
 
-        # Если пользователь написал /stats
         if text == "/stats":
-            # Сначала отправляем "Загружаю...", так как Монобанк может отвечать 1-2 секунды
-            send_to_telegram("⏳ Считаю траты за месяц...", chat_id)
+            # Запускаем подсчет статистики в отдельном фоновом потоке!
+            thread = threading.Thread(target=process_stats_background, args=(chat_id,))
+            thread.start()
 
-            # Собираем стату и отправляем
-            stats_message = get_monthly_stats()
-            send_to_telegram(stats_message, chat_id)
-
+    # Сервер моментально отвечает Телеграму "ОК", не дожидаясь окончания подсчетов
     return "OK", 200
 
 
