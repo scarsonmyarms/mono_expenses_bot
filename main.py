@@ -4,6 +4,7 @@ import os
 from decouple import config
 import time
 from datetime import datetime
+import json
 
 app = Flask(__name__)
 
@@ -13,18 +14,11 @@ CHAT_ID = config('CHAT_ID')
 MONO_TOKEN = config('MONO_TOKEN')
 WHITE_CARD_ID = config('WHITE_CARD_ID')
 
-# Базовый словарь категорий MCC (можно дополнять своими)
-MCC_CATEGORIES = {
-    5411: "🛒 Супермаркеты",
-    5812: "🍽 Рестораны",
-    5814: "🍔 Фастфуд и кофе",
-    4131: "🚌 Автобусы/Транспорт",
-    4121: "🚕 Такси",
-    5912: "💊 Аптеки",
-    8999: "🛠 Услуги",
-    # Если кода нет в списке, будет написано "Другое"
-}
-
+# Читаем наш датасет из файла один раз при запуске бота
+with open('mcc_codes.json', 'r', encoding='utf-8') as file:
+    # Загружаем JSON и сразу превращаем ключи из строк ("5411") в числа (5411),
+    # потому что Монобанк присылает их как числа.
+    MCC_DATASET = {int(k): v for k, v in json.load(file).items()}
 
 def send_to_telegram(text, chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -33,52 +27,49 @@ def send_to_telegram(text, chat_id=CHAT_ID):
 
 
 def get_monthly_stats():
-    """Спрашивает у Монобанка выписку за этот месяц и считает итог"""
-    # 1. Вычисляем начало текущего месяца
+    """Считает стату за месяц, используя загруженный датасет MCC кодов"""
     now = datetime.now()
     first_day = datetime(now.year, now.month, 1)
 
-    # Монобанк понимает время только в формате UNIX (секунды)
     from_time = int(first_day.timestamp())
     to_time = int(now.timestamp())
 
-    # 2. Делаем запрос (0 - это счет по умолчанию, черная карта)
-    # Вместо /0/ мы подставляем переменную {WHITE_CARD_ID}
     url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_time}/{to_time}"
     headers = {"X-Token": MONO_TOKEN}
 
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
-        return "❌ Ошибка при получении данных от Монобанка. Возможно, сработал лимит запросов."
+        return "❌ Ошибка при получении данных от Монобанка."
 
     transactions = response.json()
 
-    # 3. Считаем траты
     total_spent = 0
     categories_sum = {}
 
     for item in transactions:
         amount = item.get('amount', 0)
-        # Нас интересуют только траты (сумма меньше 0)
+
         if amount < 0:
             spent_uah = abs(amount) / 100
             total_spent += spent_uah
 
-            # Определяем категорию
+            # Достаем MCC код транзакции
             mcc = item.get('mcc')
-            category_name = MCC_CATEGORIES.get(mcc, f"📦 Другое (MCC {mcc})")
 
-            # Добавляем в копилку категории
+            # Ищем этот код в нашем датасете.
+            # Если такого кода в файле нет, пишем "Другое" и выводим сам код,
+            # чтобы ты мог потом добавить его в свой mcc_codes.json!
+            category_name = MCC_DATASET.get(mcc, f"❓ Неизвестный MCC: {mcc}")
+
             categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
 
-    # 4. Формируем красивое сообщение
-    message = f"📊 <b>Статистика за текущий месяц:</b>\n"
+    # Формируем сообщение
+    message = f"📊 <b>Статистика за месяц (по MCC):</b>\n"
     message += f"💸 <b>Всего потрачено:</b> {total_spent:.2f} грн\n\n"
-    message += "<b>По категориям:</b>\n"
 
-    # Сортируем категории по убыванию суммы
     sorted_cats = sorted(categories_sum.items(), key=lambda x: x[1], reverse=True)
+
     for cat, summ in sorted_cats:
         message += f"▪️ {cat}: {summ:.2f} грн\n"
 
