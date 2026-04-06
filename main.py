@@ -16,11 +16,20 @@ CHAT_ID = config('CHAT_ID')
 MONO_TOKEN = config('MONO_TOKEN')
 WHITE_CARD_ID = config('WHITE_CARD_ID')
 
-# Читаем наш датасет из файла один раз при запуске бота
+# Читаем датасет и сразу выбираем нужный язык
 with open('mcc_codes.json', 'r', encoding='utf-8') as file:
-    # Загружаем JSON и сразу превращаем ключи из строк ("5411") в числа (5411),
-    # потому что Монобанк присылает их как числа.
-    MCC_DATASET = {int(k): v for k, v in json.load(file).items()}
+    raw_data = json.load(file)
+    MCC_DATASET = {}
+    for k, v in raw_data.items():
+        # Если значение — это словарь с языками, берем украинский ('uk').
+        # Если русского почему-то нет, берем русский ('uk').
+        if isinstance(v, dict):
+            category_name = v.get('uk', v.get('ru', 'Неизвестная категория'))
+        else:
+            # Защита: если там просто текст, оставляем как есть
+            category_name = str(v)
+
+        MCC_DATASET[int(k)] = category_name
 
 def send_to_telegram(text, chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
