@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 import json
 import threading
+import traceback
 
 app = Flask(__name__)
 
@@ -26,11 +27,20 @@ def send_to_telegram(text, chat_id=CHAT_ID):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     requests.post(url, json=payload)
 
-# Создаем отдельную функцию для фоновой работы
+
 def process_stats_background(chat_id):
-    send_to_telegram("⏳ Считаю траты за месяц...", chat_id)
-    stats_message = get_monthly_stats()
-    send_to_telegram(stats_message, chat_id)
+    try:
+        # Пытаемся посчитать стату
+        stats_message = get_monthly_stats()
+        send_to_telegram(stats_message, chat_id)
+
+    except Exception as e:
+        # Если код сломался (любая ошибка), бот не зависнет, а напишет причину!
+        error_msg = f"❌ <b>Ой, код сломался!</b>\nПричина: {str(e)}"
+        send_to_telegram(error_msg, chat_id)
+
+        # Печатаем полную ошибку в логи Render, чтобы мы могли её изучить
+        print(traceback.format_exc())
 
 def get_monthly_stats():
     """Считает стату за месяц, используя загруженный датасет MCC кодов"""
