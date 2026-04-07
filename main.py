@@ -15,6 +15,7 @@ BOT_TOKEN = config('BOT_TOKEN')
 CHAT_ID = config('CHAT_ID')
 MONO_TOKEN = config('MONO_TOKEN')
 WHITE_CARD_ID = config('WHITE_CARD_ID')
+PROCESSED_TX = set()
 
 # Читаем датасет и сразу выбираем нужный язык
 with open('mcc_codes.json', 'r', encoding='utf-8') as file:
@@ -102,27 +103,53 @@ def get_monthly_stats():
 
 
 # --- РОУТ ДЛЯ МОНОБАНКА (Остался без изменений) ---
-@app.route('/mono-webhook', methods=['POST'])
-def mono_webhook():
-    data = request.json
-    if data and data.get('type') == 'StatementItem':
+def process_mono_background(data):
+    try:
         item = data['data']['statementItem']
-        amount = item['amount']
-        description = item['description']
+        tx_id = item.get('id')  # У каждой транзакции есть свой уникальный ID
+
+        # 1. Защита от дублей: проверяем, видели ли мы этот ID
+        if tx_id in PROCESSED_TX:
+            return  # Если видели — молча выходим, ничего не отправляем
+
+        # Записываем ID в наш "блокнот"
+        PROCESSED_TX.add(tx_id)
+
+        # Защита от переполнения памяти: если накопилось больше 1000 ID, очищаем блокнот
+        if len(PROCESSED_TX) > 1000:
+            PROCESSED_TX.clear()
+
+        amount = item.get('amount', 0)
 
         if amount < 0:
             spent_uah = abs(amount) / 100
-            balance_uah = item['balance'] / 100
+            balance_uah = item.get('balance', 0) / 100
+            description = item.get('description', 'Неизвестно')
 
             message = (
-                f"💸 <b>Новая трата:</b> {spent_uah} грн\n"
+                f"💸 <b>Новая трата:</b> {spent_uah:.2f} грн\n"
                 f"📝 <b>Детали:</b> {description}\n"
-                f"🏦 <b>Остаток:</b> {balance_uah} грн"
+                f"🏦 <b>Остаток:</b> {balance_uah:.2f} грн"
             )
             send_to_telegram(message)
+
+    except Exception as e:
+        print(f"Ошибка при обработке транзакции: {e}")
+
+
+@app.route('/mono-webhook', methods=['POST'])
+def mono_webhook():
+    data = request.json
+
+    if data and data.get('type') == 'StatementItem':
+        # Моментально отдаем задачу в фон
+        thread = threading.Thread(target=process_mono_background, args=(data,))
+        thread.start()
+
+    # Сразу отвечаем банку, чтобы он не слал повторные запросы
     return "OK", 200
 
-
+# --- РОУТ ДЛЯ TG (Остался без изменений) ---
 @app.route(f'/tg-{BOT_TOKEN}', methods=['POST'])
 def telegram_webhook():
     data = request.json
