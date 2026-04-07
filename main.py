@@ -16,6 +16,8 @@ CHAT_ID = config('CHAT_ID')
 MONO_TOKEN = config('MONO_TOKEN')
 WHITE_CARD_ID = config('WHITE_CARD_ID')
 PROCESSED_TX = set()
+CASH_FILE = 'cash_data.json'
+
 
 # Читаем датасет и сразу выбираем нужный язык
 with open('mcc_codes.json', 'r', encoding='utf-8') as file:
@@ -31,6 +33,48 @@ with open('mcc_codes.json', 'r', encoding='utf-8') as file:
             category_name = str(v)
 
         MCC_DATASET[int(k)] = category_name
+
+
+def save_cash_transaction(amount, description):
+    """Сохраняет трату наличными в локальный JSON файл"""
+    now = datetime.now()
+    new_entry = {
+        "amount": float(amount),
+        "description": description,
+        "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "mcc": 0  # Пометка, что это не банковская операция
+    }
+
+    # Читаем текущие данные
+    data = []
+    if os.path.exists(CASH_FILE):
+        with open(CASH_FILE, 'r', encoding='utf-8') as f:
+            try:
+                data = json.load(f)
+            except:
+                data = []
+
+    data.append(new_entry)
+
+    # Сохраняем обратно
+    with open(CASH_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_cash_transactions_for_month():
+    """Загружает наличные траты за текущий месяц"""
+    if not os.path.exists(CASH_FILE):
+        return []
+
+    now = datetime.now()
+    current_month = now.strftime("%Y-%m")
+
+    with open(CASH_FILE, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Фильтруем только за текущий месяц
+    return [item for item in data if item['date'].startswith(current_month)]
+
 
 def send_to_telegram(text, chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -73,33 +117,32 @@ def get_monthly_stats():
     total_spent = 0
     categories_sum = {}
 
+    # 1. Считаем карту
     for item in transactions:
         amount = item.get('amount', 0)
-
         if amount < 0:
             spent_uah = abs(amount) / 100
             total_spent += spent_uah
-
-            # Достаем MCC код транзакции
             mcc = item.get('mcc')
-
-            # Ищем этот код в нашем датасете.
-            # Если такого кода в файле нет, пишем "Другое" и выводим сам код,
-            # чтобы ты мог потом добавить его в свой mcc_codes.json!
-            category_name = MCC_DATASET.get(mcc, f"❓ Неизвестный MCC: {mcc}")
-
+            category_name = MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
             categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
 
-    # Формируем сообщение
-    message = f"📊 <b>Статистика за месяц (по MCC):</b>\n"
-    message += f"💸 <b>Всего потрачено:</b> {total_spent:.2f} грн\n\n"
+    # 2. ДОБАВЛЯЕМ НАЛИЧКУ
+    cash_transactions = load_cash_transactions_for_month()
+    cash_total = 0
+    for item in cash_transactions:
+        amount = item['amount']
+        cash_total += amount
+        total_spent += amount
 
-    sorted_cats = sorted(categories_sum.items(), key=lambda x: x[1], reverse=True)
+        cat_name = "💵 Наличные"
+        categories_sum[cat_name] = categories_sum.get(cat_name, 0) + amount
 
-    for cat, summ in sorted_cats:
-        message += f"▪️ {cat}: {summ:.2f} грн\n"
-
-    return message
+    # ... (формируем сообщение, добавив инфо о наличке) ...
+    message = f"📊 <b>Статистика за месяц:</b>\n"
+    message += f"💳 Карта: {total_spent - cash_total:.2f} грн\n"
+    message += f"💵 Наличка: {cash_total:.2f} грн\n"
+    message += f"💰 <b>ИТОГО:</b> {total_spent:.2f} грн\n\n"
 
 
 # --- РОУТ ДЛЯ МОНОБАНКА (Остался без изменений) ---
@@ -158,12 +201,27 @@ def telegram_webhook():
         text = data["message"]["text"]
         chat_id = data["message"]["chat"]["id"]
 
+        # Проверяем первую команду
         if text == "/stats":
             # Запускаем подсчет статистики в отдельном фоновом потоке!
             thread = threading.Thread(target=process_stats_background, args=(chat_id,))
             thread.start()
 
-    # Сервер моментально отвечает Телеграму "ОК", не дожидаясь окончания подсчетов
+        # Проверяем вторую команду (Обрати внимание, отступ такой же, как у /stats)
+        elif text.startswith("/cash"):
+            try:
+                # Разделяем строку: /cash 100 продукты -> ['/cash', '100', 'продукты']
+                parts = text.split(maxsplit=2)
+                amount = parts[1]
+                description = parts[2] if len(parts) > 2 else "Без описания"
+
+                save_cash_transaction(amount, description)
+                send_to_telegram(f"✅ Записал: {amount} грн на '{description}'", chat_id)
+            except Exception as e:
+                send_to_telegram("❌ Ошибка! Пиши так: <code>/cash 100 продукты</code>", chat_id)
+                print(f"Ошибка сохранения налички: {e}")
+
+    # Не забываем всегда отдавать OK Телеграму в самом конце
     return "OK", 200
 
 
