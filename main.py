@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import threading
 import traceback
+import gspread
 
 app = Flask(__name__)
 
@@ -18,6 +19,16 @@ WHITE_CARD_ID = config('WHITE_CARD_ID')
 PROCESSED_TX = set()
 CASH_FILE = 'cash_data.json'
 
+# --- ПОДКЛЮЧЕНИЕ К GOOGLE ---
+try:
+    # Робот читает свой файл-пропуск
+    gc = gspread.service_account(filename='google_keys.json')
+    # Открываем таблицу по имени (ИМЯ ДОЛЖНО СОВПАДАТЬ С ТЕМ, ЧТО В ГУГЛЕ!)
+    sheet = gc.open("Траты_Бота").sheet1
+    print("✅ Успешно подключились к Google Таблицам!")
+except Exception as e:
+    print(f"❌ Ошибка подключения к Google: {e}")
+    sheet = None
 
 # Читаем датасет и сразу выбираем нужный язык
 with open('mcc_codes.json', 'r', encoding='utf-8') as file:
@@ -36,44 +47,43 @@ with open('mcc_codes.json', 'r', encoding='utf-8') as file:
 
 
 def save_cash_transaction(amount, description):
-    """Сохраняет трату наличными в локальный JSON файл"""
+    """Сохраняет трату в Google Таблицу"""
+    if sheet is None:
+        raise Exception("Таблица не подключена!")
+
     now = datetime.now()
-    new_entry = {
-        "amount": float(amount),
-        "description": description,
-        "date": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "mcc": 0  # Пометка, что это не банковская операция
-    }
+    date_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Читаем текущие данные
-    data = []
-    if os.path.exists(CASH_FILE):
-        with open(CASH_FILE, 'r', encoding='utf-8') as f:
-            try:
-                data = json.load(f)
-            except:
-                data = []
-
-    data.append(new_entry)
-
-    # Сохраняем обратно
-    with open(CASH_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # Добавляем новую строку в конец таблицы
+    # Колонки: Дата | Сумма | Описание
+    sheet.append_row([date_str, float(amount), description])
 
 
 def load_cash_transactions_for_month():
-    """Загружает наличные траты за текущий месяц"""
-    if not os.path.exists(CASH_FILE):
+    """Считывает траты за этот месяц из Google Таблицы"""
+    if sheet is None:
         return []
 
     now = datetime.now()
-    current_month = now.strftime("%Y-%m")
+    current_month = now.strftime("%Y-%m")  # Например: "2023-10"
 
-    with open(CASH_FILE, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    # Получаем все данные из таблицы списком списков
+    all_rows = sheet.get_all_values()
 
-    # Фильтруем только за текущий месяц
-    return [item for item in data if item['date'].startswith(current_month)]
+    cash_transactions = []
+    # Пропускаем первую строку (заголовки), поэтому [1:]
+    for row in all_rows[1:]:
+        # row[0] - Дата, row[1] - Сумма, row[2] - Описание
+        if len(row) >= 2 and row[0].startswith(current_month):
+            try:
+                cash_transactions.append({
+                    "amount": float(row[1]),
+                    "description": row[2] if len(row) > 2 else "Без описания"
+                })
+            except ValueError:
+                pass  # Если в сумме записан текст, пропускаем строку
+
+    return cash_transactions
 
 
 def send_to_telegram(text, chat_id=CHAT_ID):
