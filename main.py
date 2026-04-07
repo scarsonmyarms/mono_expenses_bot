@@ -96,53 +96,76 @@ def process_stats_background(chat_id):
         # Печатаем полную ошибку в логи Render, чтобы мы могли её изучить
         print(traceback.format_exc())
 
+
 def get_monthly_stats():
-    """Считает стату за месяц, используя загруженный датасет MCC кодов"""
-    now = datetime.now()
-    first_day = datetime(now.year, now.month, 1)
+    """Считает общую статистику: Карта (из Моно) + Наличка (из файла)"""
+    try:
+        now = datetime.now()
+        first_day = datetime(now.year, now.month, 1)
+        from_time = int(first_day.timestamp())
+        to_time = int(now.timestamp())
 
-    from_time = int(first_day.timestamp())
-    to_time = int(now.timestamp())
+        # 1. Запрос в Монобанк
+        url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_time}/{to_time}"
+        headers = {"X-Token": MONO_TOKEN}
+        response = requests.get(url, headers=headers)
 
-    url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_time}/{to_time}"
-    headers = {"X-Token": MONO_TOKEN}
+        if response.status_code != 200:
+            return f"❌ Ошибка Монобанка: {response.status_code}. Возможно, лимит запросов (1 раз в минуту)."
 
-    response = requests.get(url, headers=headers)
+        transactions = response.json()
 
-    if response.status_code != 200:
-        return "❌ Ошибка при получении данных от Монобанка."
+        # Проверка: если Моно прислал ошибку в формате JSON
+        if isinstance(transactions, dict) and "errorDescription" in transactions:
+            return f"❌ Банк ответил: {transactions['errorDescription']}"
 
-    transactions = response.json()
+        total_spent = 0
+        categories_sum = {}
 
-    total_spent = 0
-    categories_sum = {}
+        # 2. Обработка КАРТЫ
+        for item in transactions:
+            amount = item.get('amount', 0)
+            if amount < 0:
+                spent_uah = abs(amount) / 100
+                total_spent += spent_uah
+                mcc = item.get('mcc')
+                # Берем название из нашего датасета (уже с учетом ru/uk)
+                category_name = MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
+                categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
 
-    # 1. Считаем карту
-    for item in transactions:
-        amount = item.get('amount', 0)
-        if amount < 0:
-            spent_uah = abs(amount) / 100
-            total_spent += spent_uah
-            mcc = item.get('mcc')
-            category_name = MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
-            categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
+        # 3. Обработка НАЛИЧКИ
+        cash_transactions = load_cash_transactions_for_month()
+        cash_total = 0
+        for item in cash_transactions:
+            amount = item['amount']
+            cash_total += amount
+            total_spent += amount
 
-    # 2. ДОБАВЛЯЕМ НАЛИЧКУ
-    cash_transactions = load_cash_transactions_for_month()
-    cash_total = 0
-    for item in cash_transactions:
-        amount = item['amount']
-        cash_total += amount
-        total_spent += amount
+            cat_name = "💵 Наличные"
+            categories_sum[cat_name] = categories_sum.get(cat_name, 0) + amount
 
-        cat_name = "💵 Наличные"
-        categories_sum[cat_name] = categories_sum.get(cat_name, 0) + amount
+        # 4. ФОРМИРОВАНИЕ ТЕКСТА (Самое важное!)
+        if total_spent == 0:
+            return "🤷‍♂️ В этом месяце трат пока не зафиксировано."
 
-    # ... (формируем сообщение, добавив инфо о наличке) ...
-    message = f"📊 <b>Статистика за месяц:</b>\n"
-    message += f"💳 Карта: {total_spent - cash_total:.2f} грн\n"
-    message += f"💵 Наличка: {cash_total:.2f} грн\n"
-    message += f"💰 <b>ИТОГО:</b> {total_spent:.2f} грн\n\n"
+        message = f"📊 <b>Статистика за месяц:</b>\n"
+        message += f"💳 Карта: {total_spent - cash_total:.2f} грн\n"
+        message += f"💵 Наличка: {cash_total:.2f} грн\n"
+        message += f"💰 <b>ИТОГО:</b> {total_spent:.2f} грн\n\n"
+        message += "<b>Детализация:</b>\n"
+
+        # Сортируем категории по сумме
+        sorted_cats = sorted(categories_sum.items(), key=lambda x: x[1], reverse=True)
+        for cat, summ in sorted_cats:
+            message += f"▪️ {cat}: {summ:.2f} грн\n"
+
+        # ОБЯЗАТЕЛЬНО возвращаем результат!
+        return message
+
+    except Exception as e:
+        # Если что-то пошло не так внутри функции
+        print(f"Критическая ошибка в статистике: {e}")
+        return f"❌ Произошла ошибка при расчете: {str(e)}"
 
 
 # --- РОУТ ДЛЯ МОНОБАНКА (Остался без изменений) ---
