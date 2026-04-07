@@ -24,7 +24,7 @@ try:
     # Робот читает свой файл-пропуск
     gc = gspread.service_account(filename='google_keys.json')
     # Открываем таблицу по имени (ИМЯ ДОЛЖНО СОВПАДАТЬ С ТЕМ, ЧТО В ГУГЛЕ!)
-    sheet = gc.open("Траты_Бота").sheet1
+    sheet = gc.open("MonoExpenses").sheet1
     print("✅ Успешно подключились к Google Таблицам!")
 except Exception as e:
     print(f"❌ Ошибка подключения к Google: {e}")
