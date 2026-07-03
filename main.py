@@ -178,6 +178,94 @@ def get_monthly_stats():
         return f"❌ Произошла ошибка при расчете: {str(e)}"
 
 
+# --- Дневная статистика ---
+def load_cash_transactions_for_today():
+    """Считывает траты за СЕГОДНЯ из Google Таблицы"""
+    if sheet is None:
+        return []
+
+    now = datetime.now()
+    current_day = now.strftime("%Y-%m-%d")  # Формат: 2026-07-03
+
+    all_rows = sheet.get_all_values()
+    cash_transactions = []
+
+    for row in all_rows[1:]:
+        if len(row) >= 2 and row[0].startswith(current_day):
+            try:
+                cash_transactions.append({
+                    "amount": float(row[1]),
+                    "description": row[2] if len(row) > 2 else "Без описания"
+                })
+            except ValueError:
+                pass
+
+    return cash_transactions
+
+
+def get_daily_stats():
+    """Считает общую статистику строго за СЕГОДНЯ"""
+    try:
+        now = datetime.now()
+        # Начало сегодняшнего дня (00:00:00)
+        start_of_day = datetime(now.year, now.month, now.day)
+
+        from_time = int(start_of_day.timestamp())
+        to_time = int(now.timestamp())
+
+        # 1. Запрос в Монобанк
+        url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_time}/{to_time}"
+        headers = {"X-Token": MONO_TOKEN}
+        response = requests.get(url, headers=headers)
+
+        if response.status_code != 200:
+            return f"❌ Ошибка Монобанка: {response.status_code}"
+
+        transactions = response.json()
+        if isinstance(transactions, dict) and "errorDescription" in transactions:
+            return f"❌ Банк ответил: {transactions['errorDescription']}"
+
+        total_spent = 0
+        categories_sum = {}
+
+        # 2. Обработка КАРТЫ
+        for item in transactions:
+            amount = item.get('amount', 0)
+            if amount < 0:
+                spent_uah = abs(amount) / 100
+                total_spent += spent_uah
+                mcc = item.get('mcc')
+                category_name = MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
+                categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
+
+        # 3. Обработка НАЛИЧКИ
+        cash_transactions = load_cash_transactions_for_today()
+        cash_total = 0
+        for item in cash_transactions:
+            amount = item['amount']
+            cash_total += amount
+            total_spent += amount
+            categories_sum["💵 Наличные"] = categories_sum.get("💵 Наличные", 0) + amount
+
+        # 4. ФОРМИРОВАНИЕ ТЕКСТА
+        if total_spent == 0:
+            return "🌙 <b>Итоги дня:</b>\nСегодня не было трат! Идеальный день для бюджета 💰"
+
+        message = f"🌙 <b>Итоги дня:</b>\n"
+        message += f"💳 Карта: {total_spent - cash_total:.2f} грн\n"
+        message += f"💵 Наличка: {cash_total:.2f} грн\n"
+        message += f"💰 <b>ВСЕГО ЗА СЕГОДНЯ:</b> {total_spent:.2f} грн\n\n"
+
+        sorted_cats = sorted(categories_sum.items(), key=lambda x: x[1], reverse=True)
+        for cat, summ in sorted_cats:
+            message += f"▪️ {cat}: {summ:.2f} грн\n"
+
+        return message
+
+    except Exception as e:
+        return f"❌ Ошибка в дневном отчете: {str(e)}"
+
+
 # --- РОУТ ДЛЯ МОНОБАНКА (Остался без изменений) ---
 def process_mono_background(data):
     try:
@@ -211,6 +299,24 @@ def process_mono_background(data):
 
     except Exception as e:
         print(f"Ошибка при обработке транзакции: {e}")
+
+
+# --- Будильник ---
+@app.route('/trigger-daily-report', methods=['GET'])
+def trigger_daily_report():
+    # ВАЖНО: Впиши сюда свой личный ID чата Телеграм (только цифры)
+    # Если не знаешь его, перешли любое свое сообщение боту @userinfobot
+    ADMIN_CHAT_ID = "912719804"
+
+    # Запускаем сбор отчета в фоне, чтобы сервер быстро ответил будильнику
+    def send_report():
+        msg = get_daily_stats()
+        send_to_telegram(msg, ADMIN_CHAT_ID)
+
+    thread = threading.Thread(target=send_report)
+    thread.start()
+
+    return "Отчет запущен!", 200
 
 
 @app.route('/mono-webhook', methods=['POST'])
