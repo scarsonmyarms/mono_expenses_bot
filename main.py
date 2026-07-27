@@ -309,7 +309,7 @@ def process_mono_background(data):
         print(f"Ошибка при обработке транзакции: {e}")
 
 
-# --- Будильник ---
+# --- ДЕНИЙ ЗВІТ ---
 @app.route('/trigger-daily-report', methods=['GET'])
 def trigger_daily_report():
     # ВАЖНО: Впиши сюда свой личный ID чата Телеграм (только цифры)
@@ -325,6 +325,26 @@ def trigger_daily_report():
     thread.start()
 
     return "Отчет запущен!", 200
+
+# --- МІСЯЧНИЙ ЗВІТ ---
+@app.route('/trigger-monthly-report', methods=['GET'])
+def trigger_monthly_report():
+    # ВАЖЛИВО: Сюди встав той самий ID, що і в денному звіті
+    ADMIN_CHAT_ID = "912719804"
+
+    def send_report():
+        # Беремо нашу готову функцію, яка рахує витрати за місяць
+        msg = get_monthly_stats()
+
+        # Додаємо святковий заголовок
+        header = "🏆 <b>ФІНАЛЬНИЙ ЗВІТ ЗА МІСЯЦЬ!</b> 🏆\n\n"
+
+        send_to_telegram(header + msg, ADMIN_CHAT_ID)
+
+    thread = threading.Thread(target=send_report)
+    thread.start()
+
+    return "Місячний звіт запущено!", 200
 
 
 @app.route('/mono-webhook', methods=['POST'])
