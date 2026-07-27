@@ -47,41 +47,40 @@ with open('mcc_codes.json', 'r', encoding='utf-8') as file:
 
 
 def save_cash_transaction(amount, description):
-    """Сохраняет трату в Google Таблицу"""
+    """Сохраняет трату в Google Таблицу (Готівка)"""
     if sheet is None:
         raise Exception("Таблица не подключена!")
 
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Добавляем новую строку в конец таблицы
-    # Колонки: Дата | Сумма | Описание
-    sheet.append_row([date_str, float(amount), description])
+    # Додаємо 4-й параметр - "Наличные"
+    sheet.append_row([date_str, float(amount), description, "Наличные"])
 
 
 def load_cash_transactions_for_month():
-    """Считывает траты за этот месяц из Google Таблицы"""
     if sheet is None:
         return []
-
+    """Считывает траты за этот месяц из Google Таблицы"""
     now = datetime.now()
-    current_month = now.strftime("%Y-%m")  # Например: "2023-10"
+    current_month = now.strftime("%Y-%m")
 
-    # Получаем все данные из таблицы списком списков
     all_rows = sheet.get_all_values()
-
     cash_transactions = []
-    # Пропускаем первую строку (заголовки), поэтому [1:]
+
     for row in all_rows[1:]:
-        # row[0] - Дата, row[1] - Сумма, row[2] - Описание
-        if len(row) >= 2 and row[0].startswith(current_month):
+        # ПЕРЕВІРКА: чи є в рядку слово "Карта" (у 4-й колонці)
+        is_card = len(row) >= 4 and row[3] == "Карта"
+
+        # Якщо це поточний місяць І ЦЕ НЕ КАРТА
+        if len(row) >= 2 and row[0].startswith(current_month) and not is_card:
             try:
                 cash_transactions.append({
                     "amount": float(row[1]),
                     "description": row[2] if len(row) > 2 else "Без описания"
                 })
             except ValueError:
-                pass  # Если в сумме записан текст, пропускаем строку
+                pass
 
     return cash_transactions
 
@@ -185,13 +184,17 @@ def load_cash_transactions_for_today():
         return []
 
     now = datetime.now()
-    current_day = now.strftime("%Y-%m-%d")  # Формат: 2026-07-03
+    current_month = now.strftime("%Y-%m")
 
     all_rows = sheet.get_all_values()
     cash_transactions = []
 
     for row in all_rows[1:]:
-        if len(row) >= 2 and row[0].startswith(current_day):
+        # ПЕРЕВІРКА: чи є в рядку слово "Карта" (у 4-й колонці)
+        is_card = len(row) >= 4 and row[3] == "Карта"
+
+        # Якщо це поточний місяць І ЦЕ НЕ КАРТА
+        if len(row) >= 2 and row[0].startswith(current_month) and not is_card:
             try:
                 cash_transactions.append({
                     "amount": float(row[1]),
@@ -270,25 +273,30 @@ def get_daily_stats():
 def process_mono_background(data):
     try:
         item = data['data']['statementItem']
-        tx_id = item.get('id')  # У каждой транзакции есть свой уникальный ID
+        tx_id = item.get('id')
 
-        # 1. Защита от дублей: проверяем, видели ли мы этот ID
         if tx_id in PROCESSED_TX:
-            return  # Если видели — молча выходим, ничего не отправляем
+            return
 
-        # Записываем ID в наш "блокнот"
         PROCESSED_TX.add(tx_id)
-
-        # Защита от переполнения памяти: если накопилось больше 1000 ID, очищаем блокнот
         if len(PROCESSED_TX) > 1000:
             PROCESSED_TX.clear()
 
         amount = item.get('amount', 0)
 
+        # Якщо сума від'ємна — це витрата
         if amount < 0:
             spent_uah = abs(amount) / 100
             balance_uah = item.get('balance', 0) / 100
             description = item.get('description', 'Неизвестно')
+
+            # --- НОВЕ: ЗАПИСУЄМО КАРТКОВУ ВИТРАТУ В ГУГЛ ТАБЛИЦЮ ---
+            if sheet is not None:
+                now = datetime.now()
+                date_str = now.strftime("%Y-%m-%d %H:%M:%S")
+                # Додаємо 4-й параметр - "Карта"
+                sheet.append_row([date_str, spent_uah, description, "Карта"])
+            # -------------------------------------------------------
 
             message = (
                 f"💸 <b>Новая трата:</b> {spent_uah:.2f} грн\n"
