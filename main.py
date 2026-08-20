@@ -45,39 +45,59 @@ with open('mcc_codes.json', 'r', encoding='utf-8') as file:
 
         MCC_DATASET[int(k)] = category_name
 
+CASH_CATEGORIES = {
+    "продукти": "Продукти",
+    "кафе": "Кафе. Ресторани",
+    "ресторан": "Кафе. Ресторани",
+    "таксі": "Таксі",
+    "аптека": "Аптеки",
+    "одяг": "Одяг",
+    "розваги": "Розваги та спорт",
+    "квіти": "Флористика"
+}
+
+def categorize_cash(description):
+    """Шукає ключове слово в описі і повертає категорію"""
+    desc_lower = description.lower()
+    for key, category_name in CASH_CATEGORIES.items():
+        if key in desc_lower:
+            return category_name
+    return "Інше (Готівка)" # Якщо нічого не знайшли
+
 
 def save_cash_transaction(amount, description):
-    """Сохраняет трату в Google Таблицу (Готівка)"""
     if sheet is None:
-        raise Exception("Таблица не подключена!")
+        raise Exception("Таблиця не підключена!")
 
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Додаємо 4-й параметр - "Наличные"
-    sheet.append_row([date_str, float(amount), description, "Наличные"])
+    # Визначаємо категорію на основі опису
+    category = categorize_cash(description)
+
+    # Додаємо 5-й параметр - "Категорія"
+    sheet.append_row([date_str, float(amount), description, "Наличные", category])
 
 
 def load_cash_transactions_for_month():
     if sheet is None:
         return []
-    """Считывает траты за этот месяц из Google Таблицы"""
+
     now = datetime.now()
     current_month = now.strftime("%Y-%m")
-
     all_rows = sheet.get_all_values()
     cash_transactions = []
 
     for row in all_rows[1:]:
-        # ПЕРЕВІРКА: чи є в рядку слово "Карта" (у 4-й колонці)
         is_card = len(row) >= 4 and row[3] == "Карта"
 
-        # Якщо це поточний місяць І ЦЕ НЕ КАРТА
         if len(row) >= 2 and row[0].startswith(current_month) and not is_card:
             try:
                 cash_transactions.append({
                     "amount": float(row[1]),
-                    "description": row[2] if len(row) > 2 else "Без описания"
+                    "description": row[2] if len(row) > 2 else "Без описания",
+                    # Зчитуємо 5-ту колонку, якщо вона є
+                    "category": row[4] if len(row) > 4 else "Інше (Готівка)"
                 })
             except ValueError:
                 pass
@@ -143,15 +163,19 @@ def get_monthly_stats():
                 categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
 
         # 3. Обработка НАЛИЧКИ
+        # 3. Обработка НАЛИЧКИ з категоріями
         cash_transactions = load_cash_transactions_for_month()
         cash_total = 0
         for item in cash_transactions:
             amount = item['amount']
+            cat_name = item['category']
+
             cash_total += amount
             total_spent += amount
 
-            cat_name = "💵 Наличные"
-            categories_sum[cat_name] = categories_sum.get(cat_name, 0) + amount
+            # СТВОРЮЄМО ОКРЕМУ НАЗВУ: додаємо значок і підпис (Готівка)
+            display_name = f"💵 {cat_name} (Готівка)"
+            categories_sum[display_name] = categories_sum.get(display_name, 0) + amount
 
         # 4. ФОРМИРОВАНИЕ ТЕКСТА (Самое важное!)
         if total_spent == 0:
@@ -184,21 +208,23 @@ def load_cash_transactions_for_today():
         return []
 
     now = datetime.now()
-    current_month = now.strftime("%Y-%m")
+    # ВИПРАВЛЕНО: Шукаємо саме сьогоднішній день
+    current_day = now.strftime("%Y-%m-%d")
 
     all_rows = sheet.get_all_values()
     cash_transactions = []
 
     for row in all_rows[1:]:
-        # ПЕРЕВІРКА: чи є в рядку слово "Карта" (у 4-й колонці)
         is_card = len(row) >= 4 and row[3] == "Карта"
 
-        # Якщо це поточний місяць І ЦЕ НЕ КАРТА
-        if len(row) >= 2 and row[0].startswith(current_month) and not is_card:
+        # ВИПРАВЛЕНО: перевіряємо за current_day
+        if len(row) >= 2 and row[0].startswith(current_day) and not is_card:
             try:
                 cash_transactions.append({
                     "amount": float(row[1]),
-                    "description": row[2] if len(row) > 2 else "Без описания"
+                    "description": row[2] if len(row) > 2 else "Без описания",
+                    # ВИПРАВЛЕНО: додано зчитування категорії
+                    "category": row[4] if len(row) > 4 else "Інше (Готівка)"
                 })
             except ValueError:
                 pass
@@ -242,13 +268,20 @@ def get_daily_stats():
                 categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
 
         # 3. Обработка НАЛИЧКИ
+        # 3. Обработка НАЛИЧКИ з категоріями
+        # 3. Обработка НАЛИЧКИ з категоріями
         cash_transactions = load_cash_transactions_for_today()
         cash_total = 0
         for item in cash_transactions:
             amount = item['amount']
+            cat_name = item['category']
+
             cash_total += amount
             total_spent += amount
-            categories_sum["💵 Наличные"] = categories_sum.get("💵 Наличные", 0) + amount
+
+            # СТВОРЮЄМО ОКРЕМУ НАЗВУ: додаємо значок і підпис (Готівка)
+            display_name = f"💵 {cat_name} (Готівка)"
+            categories_sum[display_name] = categories_sum.get(display_name, 0) + amount
 
         # 4. ФОРМИРОВАНИЕ ТЕКСТА
         if total_spent == 0:
