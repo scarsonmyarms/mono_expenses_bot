@@ -8,6 +8,8 @@ import json
 import threading
 import traceback
 import gspread
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Налаштування Київського часового поясу (з урахуванням літнього/зимового часу)
 try:
@@ -55,7 +57,9 @@ CASH_CATEGORIES = {
     "аптека": "Аптеки",
     "одяг": "Одяг",
     "розваги": "Розваги та спорт",
-    "квіти": "Флористика"
+    "квіти": "Флористика",
+    "олександр": "Орендна плата",
+    "любомир": "Комунальні послуги"
 }
 
 def categorize_cash(description):
@@ -65,6 +69,20 @@ def categorize_cash(description):
         if key in desc_lower:
             return category_name
     return "Інше"
+
+
+def get_category_for_mono(mcc, description):
+    """Визначає категорію: спочатку за специфічним описом, потім за MCC"""
+    desc_lower = description.lower()
+
+    # 1. Наші власні правила (перевизначення за ім'ям)
+    if "любомир л" in desc_lower:
+        return "Комунальні послуги"
+    if "олександр б" in desc_lower:
+        return "Орендна плата"
+
+    # 2. Якщо співпадінь немає, шукаємо у стандартній базі MCC
+    return MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
 
 
 def save_cash_transaction(amount, description):
@@ -179,7 +197,10 @@ def get_monthly_stats():
                 spent_uah = abs(amount) / 100
                 total_spent += spent_uah
                 mcc = item.get('mcc')
-                category_name = MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
+                description = item.get('description', '')
+
+                # ВИКОРИСТОВУЄМО ПЕРЕХОПЛЮВАЧ:
+                category_name = get_category_for_mono(mcc, description)
                 categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
 
         # 3. Обробка ГОТІВКИ
@@ -247,7 +268,10 @@ def get_daily_stats():
                 spent_uah = abs(amount) / 100
                 total_spent += spent_uah
                 mcc = item.get('mcc')
-                category_name = MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
+                description = item.get('description', '')
+
+                # ВИКОРИСТОВУЄМО ПЕРЕХОПЛЮВАЧ:
+                category_name = get_category_for_mono(mcc, description)
                 categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
 
         # 3. Обробка ГОТІВКИ (за сьогодні)
@@ -303,7 +327,9 @@ def process_mono_background(data):
             balance_uah = item.get('balance', 0) / 100
             description = item.get('description', 'Невідомо')
             mcc = item.get('mcc')
-            category_name = MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
+
+            # ВИКОРИСТОВУЄМО ПЕРЕХОПЛЮВАЧ:
+            category_name = get_category_for_mono(mcc, description)
 
             # 1. Беремо точний час транзакції з Монобанку і конвертуємо в Київський час
             tx_time = item.get('time')
@@ -327,37 +353,6 @@ def process_mono_background(data):
 
     except Exception as e:
         print(f"Помилка при обробці транзакції Монобанку: {e}")
-
-
-# --- ДЕННИЙ ЗВІТ ---
-@app.route('/trigger-daily-report', methods=['GET'])
-def trigger_daily_report():
-    ADMIN_CHAT_ID = "912719804"
-
-    def send_report():
-        msg = get_daily_stats()
-        send_to_telegram(msg, ADMIN_CHAT_ID)
-
-    thread = threading.Thread(target=send_report)
-    thread.start()
-
-    return "Звіт запущено!", 200
-
-
-# --- МІСЯЧНИЙ ЗВІТ ---
-@app.route('/trigger-monthly-report', methods=['GET'])
-def trigger_monthly_report():
-    ADMIN_CHAT_ID = "912719804"
-
-    def send_report():
-        msg = get_monthly_stats()
-        header = "🏆 <b>ФІНАЛЬНИЙ ЗВІТ ЗА МІСЯЦЬ!</b> 🏆\n\n"
-        send_to_telegram(header + msg, ADMIN_CHAT_ID)
-
-    thread = threading.Thread(target=send_report)
-    thread.start()
-
-    return "Місячний звіт запущено!", 200
 
 
 # --- ВЕБХУК ДЛЯ МОНОБАНКУ (GET + POST) ---
@@ -401,6 +396,31 @@ def telegram_webhook():
                 print(f"Помилка збереження готівки: {e}")
 
     return "OK", 200
+
+
+# --- ВНУТРІШНІЙ БУДИЛЬНИК ---
+def scheduled_daily():
+    ADMIN_CHAT_ID = "912719804" # Твій ID
+    msg = get_daily_stats()
+    send_to_telegram(msg, ADMIN_CHAT_ID)
+
+def scheduled_monthly():
+    ADMIN_CHAT_ID = "912719804" # Твій ID
+    msg = get_monthly_stats()
+    header = "🏆 <b>ФІНАЛЬНИЙ ЗВІТ ЗА МІСЯЦЬ!</b> 🏆\n\n"
+    send_to_telegram(header + msg, ADMIN_CHAT_ID)
+
+# Налаштовуємо планувальник з Київським часом
+scheduler = BackgroundScheduler(timezone=KYIV_TZ)
+
+# Запускаємо денний звіт щодня о 23:55
+scheduler.add_job(scheduled_daily, CronTrigger(hour=23, minute=55))
+
+# Запускаємо місячний звіт в останній день місяця о 23:50
+scheduler.add_job(scheduled_monthly, CronTrigger(day='last', hour=23, minute=50))
+
+# Старт будильника
+scheduler.start()
 
 
 if __name__ == '__main__':
