@@ -59,7 +59,13 @@ CASH_CATEGORIES = {
     "розваги": "Розваги та спорт",
     "квіти": "Флористика",
     "олександр": "Орендна плата",
-    "любомир": "Комунальні послуги"
+    "любомир": "Комунальні послуги",
+    "окко": "Бензин",
+    "okko": "Бензин",
+    "ukrnafta": "Бензин",
+    "upg": "Бензин",
+    "wog": "Бензин",
+    "бензин": "Бензин"
 }
 
 def categorize_cash(description):
@@ -80,6 +86,11 @@ def get_category_for_mono(mcc, description):
         return "Комунальні послуги"
     if "олександр б" in desc_lower:
         return "Орендна плата"
+
+    # НОВЕ ПРАВИЛО: Перевірка на заправки та пальне
+    fuel_keywords = ["окко", "okko", "ukrnafta", "upg", "wog", "бензин"]
+    if any(keyword in desc_lower for keyword in fuel_keywords):
+        return "Бензин"
 
     # 2. Якщо співпадінь немає, шукаємо у стандартній базі MCC
     return MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
