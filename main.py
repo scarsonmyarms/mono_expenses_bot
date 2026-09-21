@@ -87,6 +87,10 @@ def get_category_for_mono(mcc, description):
     if "олександр б" in desc_lower:
         return "Орендна плата"
 
+    # Правило для накопичень (ловимо будь-яку банку Монобанку)
+    if "банки" in desc_lower or "на банку" in desc_lower:
+        return "Накопичення"
+
     # НОВЕ ПРАВИЛО: Перевірка на заправки та пальне
     fuel_keywords = ["окко", "okko", "ukrnafta", "upg", "wog", "бензин"]
     if any(keyword in desc_lower for keyword in fuel_keywords):
