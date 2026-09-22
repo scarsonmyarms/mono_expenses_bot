@@ -335,6 +335,8 @@ def process_mono_background(data):
             PROCESSED_TX.clear()
 
         amount = item.get('amount', 0)
+        description = item.get('description', 'Неизвестно')
+        balance_uah = item.get('balance', 0) / 100
 
         # Якщо сума від'ємна — це витрата
         if amount < 0:
@@ -365,6 +367,35 @@ def process_mono_background(data):
                 f"🏦 <b>Залишок:</b> {balance_uah:.2f} грн"
             )
             send_to_telegram(message)
+
+        # 2. НАДХОДЖЕННЯ (сума додатна)
+        elif amount > 0:
+        income_uah = amount / 100
+
+        if sheet is not None:
+            now = datetime.now()
+            date_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+            # Читаємо поточні дані, щоб знайти вільний рядок або заповнити колонки G, H, I
+            # Використовуємо метод update для конкретних стовпців G (7), H (8), I (9)
+            # Або простіший шпаргалковий метод через виправлення рядків,
+            # проте найпростіший спосіб для gspread додавати в кінець таблиці з урахуванням колонок:
+
+            # Отримуємо всі рядки, щоб знайти наступний вільний для колонок G-I
+            all_rows = sheet.get_all_values()
+            next_row = len(all_rows) + 1
+
+            # Записуємо точково в колонки G, H, I (7, 8, 9)
+            sheet.update_cell(next_row, 7, date_str)  # G: Дата
+            sheet.update_cell(next_row, 8, income_uah)  # H: Сума
+            sheet.update_cell(next_row, 9, description)  # I: Опис
+
+        message = (
+            f"💰 <b>Надходження (Зарплата/Переказ):</b> +{income_uah:.2f} грн\n"
+            f"📝 <b>Детали:</b> {description}\n"
+            f"🏦 <b>Остаток:</b> {balance_uah:.2f} грн"
+        )
+        send_to_telegram(message)
 
     except Exception as e:
         print(f"Помилка при обробці транзакції Монобанку: {e}")
