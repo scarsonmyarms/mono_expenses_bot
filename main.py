@@ -369,6 +369,10 @@ def process_mono_background(data):
     except Exception as e:
         print(f"Помилка при обробці транзакції Монобанку: {e}")
 
+# --- головна сторінка для статусу 200 ---
+@app.route('/', methods=['GET'])
+def home():
+    return "Bot is alive and working!", 200
 
 # --- ВЕБХУК ДЛЯ МОНОБАНКУ (GET + POST) ---
 @app.route('/mono-webhook', methods=['GET', 'POST'])
