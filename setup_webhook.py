@@ -1,19 +1,15 @@
 import requests
 from decouple import config
 
-# Вставьте ваш новый токен в кавычки
 MONO_TOKEN = config("MONO_TOKEN")
+MONO_WEBHOOK_SECRET = config("MONO_WEBHOOK_SECRET")
+WEBHOOK_URL = f"https://mono-expenses-bot.onrender.com/mono-webhook/{MONO_WEBHOOK_SECRET}"
 
-# Ссылка на ваш запущенный бот на Render
-WEBHOOK_URL = "https://mono-expenses-bot.onrender.com/mono-webhook"
-
-print("Отправляем запрос в Монобанк...")
-
+print("Надсилаємо запит у Монобанк...")
 response = requests.post(
     "https://api.monobank.ua/personal/webhook",
     headers={"X-Token": MONO_TOKEN},
-    json={"webHookUrl": WEBHOOK_URL}  # Python сам правильно расставит все кавычки!
+    json={"webHookUrl": WEBHOOK_URL},
+    timeout=30,
 )
-
-# Смотрим ответ от банка
-print("Ответ от сервера:", response.text)
+print(response.status_code, response.text)

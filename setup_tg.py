@@ -2,10 +2,12 @@ import requests
 from decouple import config
 
 BOT_TOKEN = config("BOT_TOKEN")
-# Твоя ссылка на Render! Обрати внимание на конец ссылки: /tg-ТВОЙ_ТОКЕН_БОТА
-RENDER_URL = f"https://mono-expenses-bot.onrender.com/tg-{BOT_TOKEN}"
+TG_SECRET = config("TG_SECRET")
+WEBHOOK_URL = "https://mono-expenses-bot.onrender.com/tg-webhook"
 
-url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-response = requests.post(url, json={"url": RENDER_URL})
-
+response = requests.post(
+    f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+    json={"url": WEBHOOK_URL, "secret_token": TG_SECRET},
+    timeout=15,
+)
 print(response.text)

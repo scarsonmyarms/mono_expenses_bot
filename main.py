@@ -1,478 +1,520 @@
-from flask import Flask, request
-import requests
-import os
-from decouple import config
-import time
-from datetime import datetime, timezone, timedelta
+import hmac
+import html
 import json
+import math
+import os
 import threading
+import time
 import traceback
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+
 import gspread
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from decouple import config
+from flask import Flask, abort, request
 
-# Налаштування Київського часового поясу (з урахуванням літнього/зимового часу)
+# --- ЧАСОВИЙ ПОЯС ---
 try:
     from zoneinfo import ZoneInfo
     KYIV_TZ = ZoneInfo("Europe/Kyiv")
 except Exception:
-    # Запасний варіант для старих середовищ
-    KYIV_TZ = timezone(timedelta(hours=3))
+    KYIV_TZ = timezone(timedelta(hours=3))  # запасний варіант для старих середовищ
+
+# --- НАЛАШТУВАННЯ ---
+BOT_TOKEN = config("BOT_TOKEN")
+CHAT_ID = str(config("CHAT_ID"))
+MONO_TOKEN = config("MONO_TOKEN")
+WHITE_CARD_ID = config("WHITE_CARD_ID")
+
+# Секрети (придумайте довгі випадкові рядки: латиниця, цифри, _ і -)
+TG_SECRET = config("TG_SECRET")                    # перевіряється в заголовку від Telegram
+MONO_WEBHOOK_SECRET = config("MONO_WEBHOOK_SECRET")  # частина URL вебхука Монобанку
+CRON_SECRET = config("CRON_SECRET", default="")    # для зовнішнього крону (необов'язково)
+
+ENABLE_SCHEDULER = config("ENABLE_SCHEDULER", default=True, cast=bool)
+GOOGLE_KEYS_FILE = config("GOOGLE_KEYS_FILE", default="google_keys.json")
+SPREADSHEET_NAME = config("SPREADSHEET_NAME", default="MonoExpenses")
+INCOME_SHEET_NAME = "Надходження"
+
+HTTP_TIMEOUT = 15
+DATE_FMT = "%Y-%m-%d %H:%M:%S"
+TYPE_CARD = "Карта"
+TYPE_CASH = "Готівка"
+SAVINGS_CATEGORY = "Накопичення"
+
+MONTHS_UK = ["січень", "лютий", "березень", "квітень", "травень", "червень",
+             "липень", "серпень", "вересень", "жовтень", "листопад", "грудень"]
 
 app = Flask(__name__)
 
-# Читаємо ключі
-BOT_TOKEN = config('BOT_TOKEN')
-CHAT_ID = config('CHAT_ID')
-MONO_TOKEN = config('MONO_TOKEN')
-WHITE_CARD_ID = config('WHITE_CARD_ID')
-PROCESSED_TX = set()
-CASH_FILE = 'cash_data.json'
 
-# --- ПІДКЛЮЧЕННЯ ДО GOOGLE ТАБЛИЦЬ ---
-try:
-    gc = gspread.service_account(filename='google_keys.json')
-    sheet = gc.open("MonoExpenses").sheet1
-    print("✅ Успішно підключилися до Google Таблиць!")
-except Exception as e:
-    print(f"❌ Помилка підключення до Google: {e}")
-    sheet = None
+# =====================================================================
+# КАТЕГОРІЇ
+# =====================================================================
+FUEL_KEYWORDS = ("окко", "okko", "ukrnafta", "укрнафта", "upg", "wog", "бензин")
 
-# Читаємо датасет MCC
-with open('mcc_codes.json', 'r', encoding='utf-8') as file:
-    raw_data = json.load(file)
-    MCC_DATASET = {}
-    for k, v in raw_data.items():
-        if isinstance(v, dict):
-            category_name = v.get('uk', v.get('ru', 'Невідома категорія'))
+# Правила для картки: перевіряються по черзі ДО пошуку за MCC
+MONO_RULES = [
+    (("любомир л",), "Комунальні послуги"),
+    (("олександр б",), "Орендна плата"),
+    (("банки", "на банку"), SAVINGS_CATEGORY),
+    (FUEL_KEYWORDS, "Бензин"),
+]
+
+# Правила для готівки (за ключовим словом в описі)
+CASH_RULES = [
+    (("продукти",), "Продукти"),
+    (("кафе", "ресторан"), "Кафе. Ресторани"),
+    (("таксі",), "Таксі"),
+    (("аптека",), "Аптеки"),
+    (("одяг",), "Одяг"),
+    (("розваги",), "Розваги та спорт"),
+    (("квіти",), "Флористика"),
+    (("олександр",), "Орендна плата"),
+    (("любомир",), "Комунальні послуги"),
+    (FUEL_KEYWORDS, "Бензин"),
+]
+
+
+def load_mcc_dataset(path="mcc_codes.json"):
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    dataset = {}
+    for code, value in raw.items():
+        if isinstance(value, dict):
+            name = value.get("uk") or value.get("ru") or "Невідома категорія"
         else:
-            category_name = str(v)
-        MCC_DATASET[int(k)] = category_name
+            name = str(value)
+        dataset[int(code)] = name
+    return dataset
 
-CASH_CATEGORIES = {
-    "продукти": "Продукти",
-    "кафе": "Кафе. Ресторани",
-    "ресторан": "Кафе. Ресторани",
-    "таксі": "Таксі",
-    "аптека": "Аптеки",
-    "одяг": "Одяг",
-    "розваги": "Розваги та спорт",
-    "квіти": "Флористика",
-    "олександр": "Орендна плата",
-    "любомир": "Комунальні послуги",
-    "окко": "Бензин",
-    "okko": "Бензин",
-    "ukrnafta": "Бензин",
-    "upg": "Бензин",
-    "wog": "Бензин",
-    "бензин": "Бензин"
-}
+
+MCC_DATASET = load_mcc_dataset()
+
+
+def match_rules(description, rules):
+    desc = (description or "").lower()
+    for keywords, category in rules:
+        if any(k in desc for k in keywords):
+            return category
+    return None
+
 
 def categorize_cash(description):
-    """Шукає ключове слово в описі і повертає категорію"""
-    desc_lower = description.lower()
-    for key, category_name in CASH_CATEGORIES.items():
-        if key in desc_lower:
-            return category_name
-    return "Інше"
+    return match_rules(description, CASH_RULES) or "Інше"
 
 
-def get_category_for_mono(mcc, description):
-    """Визначає категорію: спочатку за специфічним описом, потім за MCC"""
-    desc_lower = description.lower()
-
-    # 1. Наші власні правила (перевизначення за ім'ям)
-    if "любомир л" in desc_lower:
-        return "Комунальні послуги"
-    if "олександр б" in desc_lower:
-        return "Орендна плата"
-
-    # Правило для накопичень (ловимо будь-яку банку Монобанку)
-    if "банки" in desc_lower or "на банку" in desc_lower:
-        return "Накопичення"
-
-    # НОВЕ ПРАВИЛО: Перевірка на заправки та пальне
-    fuel_keywords = ["окко", "okko", "ukrnafta", "upg", "wog", "бензин"]
-    if any(keyword in desc_lower for keyword in fuel_keywords):
-        return "Бензин"
-
-    # 2. Якщо співпадінь немає, шукаємо у стандартній базі MCC
-    return MCC_DATASET.get(mcc, f"❓ MCC: {mcc}")
+def categorize_mono(mcc, description):
+    return (match_rules(description, MONO_RULES)
+            or MCC_DATASET.get(mcc)
+            or f"❓ MCC: {mcc}")
 
 
-def save_cash_transaction(amount, description):
-    if sheet is None:
-        raise Exception("Таблиця не підключена!")
-
-    # Фіксуємо точний київський час
-    now = datetime.now(KYIV_TZ)
-    date_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    category = categorize_cash(description)
-
-    # 5 колонок: Дата, Сума, Опис, Тип, Категорія
-    sheet.append_row([date_str, float(amount), description, "Наличные", category])
+# =====================================================================
+# GOOGLE ТАБЛИЦІ (підключення ліниве, з повторною спробою)
+# =====================================================================
+_connect_lock = threading.Lock()
+_write_lock = threading.Lock()
+_spreadsheet = None
 
 
-def load_cash_transactions_for_month():
-    if sheet is None:
-        return []
-
-    now = datetime.now(KYIV_TZ)
-    current_month = now.strftime("%Y-%m")
-    all_rows = sheet.get_all_values()
-    cash_transactions = []
-
-    for row in all_rows[1:]:
-        is_card = len(row) >= 4 and row[3] == "Карта"
-
-        if len(row) >= 2 and row[0].startswith(current_month) and not is_card:
-            try:
-                cash_transactions.append({
-                    "amount": float(row[1]),
-                    "description": row[2] if len(row) > 2 else "Без опису",
-                    "category": row[4] if len(row) > 4 else "Інше"
-                })
-            except ValueError:
-                pass
-
-    return cash_transactions
+def get_spreadsheet():
+    global _spreadsheet
+    with _connect_lock:
+        if _spreadsheet is None:
+            gc = gspread.service_account(filename=GOOGLE_KEYS_FILE)
+            _spreadsheet = gc.open(SPREADSHEET_NAME)
+            print("✅ Підключилися до Google Таблиць")
+        return _spreadsheet
 
 
-def load_cash_transactions_for_today():
-    """Зчитує витрати готівкою строго за СЬОГОДНІ"""
-    if sheet is None:
-        return []
+def expenses_sheet():
+    return get_spreadsheet().sheet1
 
-    now = datetime.now(KYIV_TZ)
-    current_day = now.strftime("%Y-%m-%d")
 
-    all_rows = sheet.get_all_values()
-    cash_transactions = []
+def income_sheet():
+    ss = get_spreadsheet()
+    try:
+        return ss.worksheet(INCOME_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=INCOME_SHEET_NAME, rows=1000, cols=3)
+        ws.append_row(["Дата", "Сума", "Опис"])
+        return ws
 
-    for row in all_rows[1:]:
-        is_card = len(row) >= 4 and row[3] == "Карта"
 
-        if len(row) >= 2 and row[0].startswith(current_day) and not is_card:
-            try:
-                cash_transactions.append({
-                    "amount": float(row[1]),
-                    "description": row[2] if len(row) > 2 else "Без опису",
-                    "category": row[4] if len(row) > 4 else "Інше"
-                })
-            except ValueError:
-                pass
+def append_row(worksheet, row):
+    with _write_lock:  # щоб два потоки не писали одночасно
+        worksheet.append_row(row)
 
-    return cash_transactions
+
+def parse_number(value):
+    cleaned = value.replace("\xa0", "").replace(" ", "").replace(",", ".")
+    return float(cleaned)
+
+
+def load_cash_transactions(start, end):
+    """Готівкові витрати з таблиці в проміжку [start, end]."""
+    rows = expenses_sheet().get_all_values()
+    result = []
+    for row in rows[1:]:
+        if len(row) < 2 or not row[0]:
+            continue
+        if len(row) >= 4 and row[3] == TYPE_CARD:
+            continue
+        try:
+            dt = datetime.strptime(row[0][:19], DATE_FMT).replace(tzinfo=KYIV_TZ)
+            amount = parse_number(row[1])
+        except ValueError:
+            continue
+        if start <= dt <= end:
+            result.append({
+                "amount": amount,
+                "category": row[4] if len(row) > 4 and row[4] else "Інше",
+            })
+    return result
+
+
+# =====================================================================
+# TELEGRAM
+# =====================================================================
+def esc(text):
+    return html.escape(str(text or ""))
 
 
 def send_to_telegram(text, chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    requests.post(url, json=payload)
-
-
-def process_stats_background(chat_id):
     try:
-        stats_message = get_monthly_stats()
-        send_to_telegram(stats_message, chat_id)
-    except Exception as e:
-        error_msg = f"❌ <b>Помилка розрахунку:</b>\n{str(e)}"
-        send_to_telegram(error_msg, chat_id)
-        print(traceback.format_exc())
+        r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            print(f"Telegram помилка {r.status_code}: {r.text}")
+    except requests.RequestException as e:
+        print(f"Telegram недоступний: {e}")
 
 
-def get_monthly_stats():
-    """Рахує місячну статистику з урахуванням категорій"""
+def run_in_background(func, *args):
+    def wrapper():
+        try:
+            func(*args)
+        except Exception:
+            print(traceback.format_exc())
+    threading.Thread(target=wrapper, daemon=True).start()
+
+
+# =====================================================================
+# МОНОБАНК: ВИПИСКА (з урахуванням ліміту 1 запит / 60 с)
+# =====================================================================
+MONO_MIN_INTERVAL = 61
+MONO_PAGE_SIZE = 500
+_mono_lock = threading.Lock()
+_last_mono_call = 0.0
+
+
+def mono_wait_seconds():
+    return max(0.0, MONO_MIN_INTERVAL - (time.time() - _last_mono_call))
+
+
+def fetch_statement(from_ts, to_ts):
+    """Повертає всі транзакції за період. Якщо їх понад 500, догружає частинами."""
+    global _last_mono_call
+    items, seen = [], set()
+    with _mono_lock:
+        while True:
+            wait = mono_wait_seconds()
+            if wait > 0:
+                time.sleep(wait)
+
+            url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_ts}/{to_ts}"
+            r = requests.get(url, headers={"X-Token": MONO_TOKEN}, timeout=HTTP_TIMEOUT)
+            _last_mono_call = time.time()
+
+            if r.status_code != 200:
+                raise RuntimeError(f"Монобанк відповів {r.status_code}: {r.text[:200]}")
+
+            batch = r.json()
+            for item in batch:
+                if item.get("id") not in seen:
+                    seen.add(item.get("id"))
+                    items.append(item)
+
+            if len(batch) < MONO_PAGE_SIZE:
+                return items
+            to_ts = min(item["time"] for item in batch)  # виписка йде від нових до старих
+
+
+# =====================================================================
+# СТАТИСТИКА
+# =====================================================================
+def period_bounds(kind, now=None):
+    now = now or datetime.now(KYIV_TZ)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if kind == "today":
+        return midnight, now
+    if kind == "month":
+        return midnight.replace(day=1), now
+    if kind == "prev_month":
+        end = midnight.replace(day=1) - timedelta(seconds=1)
+        return end.replace(day=1, hour=0, minute=0, second=0), end
+    raise ValueError(f"Невідомий період: {kind}")
+
+
+def build_stats(kind):
+    start, end = period_bounds(kind)
+    transactions = fetch_statement(int(start.timestamp()), int(end.timestamp()))
+
+    card_total = savings_total = cash_total = 0.0
+    categories = {}
+
+    for item in transactions:
+        amount = item.get("amount", 0)
+        if amount >= 0:
+            continue
+        spent = abs(amount) / 100
+        category = categorize_mono(item.get("mcc"), item.get("description", ""))
+        if category == SAVINGS_CATEGORY:
+            savings_total += spent  # накопичення не вважаємо витратами
+            continue
+        card_total += spent
+        categories[category] = categories.get(category, 0) + spent
+
+    for item in load_cash_transactions(start, end):
+        cash_total += item["amount"]
+        key = f"💵 {item['category']} (готівка)"
+        categories[key] = categories.get(key, 0) + item["amount"]
+
+    total = card_total + cash_total
+
+    if kind == "today":
+        title = "🌙 <b>Підсумки дня</b>"
+    elif kind == "month":
+        title = "📊 <b>Статистика за місяць</b>"
+    else:
+        title = f"🏆 <b>ФІНАЛЬНИЙ ЗВІТ: {MONTHS_UK[start.month - 1]} {start.year}</b> 🏆"
+
+    if total == 0 and savings_total == 0:
+        return f"{title}\nВитрат не зафіксовано 💰"
+
+    lines = [
+        title,
+        f"💳 Картка: {card_total:.2f} грн",
+        f"💵 Готівка: {cash_total:.2f} грн",
+        f"💰 <b>РАЗОМ:</b> {total:.2f} грн",
+    ]
+    if savings_total:
+        lines.append(f"🐷 Відкладено в банки: {savings_total:.2f} грн")
+
+    if categories:
+        lines.append("\n<b>Деталізація:</b>")
+        for cat, amount in sorted(categories.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"▪️ {esc(cat)}: {amount:.2f} грн")
+
+    return "\n".join(lines)
+
+
+def send_stats(kind, chat_id=CHAT_ID):
+    if mono_wait_seconds() > 5:
+        send_to_telegram("⏳ Монобанк дозволяє 1 запит на хвилину, рахую трохи згодом...", chat_id)
     try:
-        now = datetime.now(KYIV_TZ)
-        first_day = datetime(now.year, now.month, 1, tzinfo=KYIV_TZ)
-        from_time = int(first_day.timestamp())
-        to_time = int(now.timestamp())
-
-        # 1. Запит у Монобанк
-        url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_time}/{to_time}"
-        headers = {"X-Token": MONO_TOKEN}
-        response = requests.get(url, headers=headers)
-
-        if response.status_code != 200:
-            return f"❌ Помилка Монобанку: {response.status_code}. Ліміт: 1 запит на хвилину."
-
-        transactions = response.json()
-        if isinstance(transactions, dict) and "errorDescription" in transactions:
-            return f"❌ Банк відповів: {transactions['errorDescription']}"
-
-        total_spent = 0
-        categories_sum = {}
-
-        # 2. Обробка КАРТКИ
-        for item in transactions:
-            amount = item.get('amount', 0)
-            if amount < 0:
-                spent_uah = abs(amount) / 100
-                total_spent += spent_uah
-                mcc = item.get('mcc')
-                description = item.get('description', '')
-
-                # ВИКОРИСТОВУЄМО ПЕРЕХОПЛЮВАЧ:
-                category_name = get_category_for_mono(mcc, description)
-                categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
-
-        # 3. Обробка ГОТІВКИ
-        cash_transactions = load_cash_transactions_for_month()
-        cash_total = 0
-        for item in cash_transactions:
-            amount = item['amount']
-            cat_name = item['category']
-
-            cash_total += amount
-            total_spent += amount
-
-            display_name = f"💵 {cat_name} (Готівка)"
-            categories_sum[display_name] = categories_sum.get(display_name, 0) + amount
-
-        # 4. Формування тексту
-        if total_spent == 0:
-            return "🤷‍♂️ У цьому місяці витрат поки не зафіксовано."
-
-        message = f"📊 <b>Статистика за місяць:</b>\n"
-        message += f"💳 Картка: {total_spent - cash_total:.2f} грн\n"
-        message += f"💵 Готівка: {cash_total:.2f} грн\n"
-        message += f"💰 <b>РАЗОМ:</b> {total_spent:.2f} грн\n\n"
-        message += "<b>Деталізація:</b>\n"
-
-        sorted_cats = sorted(categories_sum.items(), key=lambda x: x[1], reverse=True)
-        for cat, summ in sorted_cats:
-            message += f"▪️ {cat}: {summ:.2f} грн\n"
-
-        return message
-
+        send_to_telegram(build_stats(kind), chat_id)
     except Exception as e:
-        print(f"Критична помилка в статистиці: {e}")
-        return f"❌ Сталася помилка при розрахунку: {str(e)}"
+        send_to_telegram(f"❌ <b>Помилка розрахунку:</b>\n{esc(e)}", chat_id)
+        raise
 
 
-def get_daily_stats():
-    """Рахує статистику строго за СЬОГОДНІ"""
+# =====================================================================
+# ОБРОБКА ТРАНЗАКЦІЙ МОНОБАНКУ
+# =====================================================================
+MAX_PROCESSED = 1000
+_processed_tx = OrderedDict()
+_processed_lock = threading.Lock()
+
+
+def already_processed(tx_id):
+    with _processed_lock:
+        if tx_id in _processed_tx:
+            return True
+        _processed_tx[tx_id] = True
+        if len(_processed_tx) > MAX_PROCESSED:
+            _processed_tx.popitem(last=False)  # видаляємо найстаріший
+        return False
+
+
+def process_mono_transaction(data):
+    payload = data.get("data") or {}
+    if payload.get("account") != WHITE_CARD_ID:
+        return  # подія з іншої картки чи банки
+
+    item = payload.get("statementItem") or {}
+    tx_id = item.get("id")
+    if not tx_id or already_processed(tx_id):
+        return
+
+    amount = item.get("amount", 0)
+    description = item.get("description") or "Без опису"
+    balance = item.get("balance", 0) / 100
+    tx_time = item.get("time")
+    dt = datetime.fromtimestamp(tx_time, tz=KYIV_TZ) if tx_time else datetime.now(KYIV_TZ)
+    date_str = dt.strftime(DATE_FMT)
+
+    sheet_warning = ""
+
+    if amount < 0:
+        spent = abs(amount) / 100
+        category = categorize_mono(item.get("mcc"), description)
+        try:
+            append_row(expenses_sheet(), [date_str, spent, description, TYPE_CARD, category])
+        except Exception as e:
+            print(f"Не вдалося записати витрату: {e}")
+            sheet_warning = "\n⚠️ Не вдалося записати в таблицю"
+
+        send_to_telegram(
+            f"💸 <b>Нова витрата:</b> {spent:.2f} грн\n"
+            f"🏷 <b>Категорія:</b> {esc(category)}\n"
+            f"📝 <b>Деталі:</b> {esc(description)}\n"
+            f"🏦 <b>Залишок:</b> {balance:.2f} грн"
+            f"{sheet_warning}"
+        )
+
+    elif amount > 0:
+        income = amount / 100
+        try:
+            append_row(income_sheet(), [date_str, income, description])
+        except Exception as e:
+            print(f"Не вдалося записати надходження: {e}")
+            sheet_warning = "\n⚠️ Не вдалося записати в таблицю"
+
+        send_to_telegram(
+            f"💰 <b>Надходження:</b> +{income:.2f} грн\n"
+            f"📝 <b>Деталі:</b> {esc(description)}\n"
+            f"🏦 <b>Залишок:</b> {balance:.2f} грн"
+            f"{sheet_warning}"
+        )
+
+
+# =====================================================================
+# ГОТІВКА
+# =====================================================================
+def parse_cash_args(args):
+    parts = args.split(maxsplit=1)
+    if not parts:
+        raise ValueError("немає суми")
+    amount = float(parts[0].replace(",", "."))
+    if not math.isfinite(amount) or amount <= 0 or amount > 1_000_000:
+        raise ValueError("некоректна сума")
+    description = parts[1].strip() if len(parts) > 1 else "Без опису"
+    return round(amount, 2), description
+
+
+def handle_cash(args, chat_id):
     try:
-        now = datetime.now(KYIV_TZ)
-        start_of_day = datetime(now.year, now.month, now.day, tzinfo=KYIV_TZ)
+        amount, description = parse_cash_args(args)
+    except ValueError:
+        send_to_telegram("❌ Пиши так: <code>/cash 100 продукти</code>", chat_id)
+        return
 
-        from_time = int(start_of_day.timestamp())
-        to_time = int(now.timestamp())
-
-        # 1. Запит у Монобанк
-        url = f"https://api.monobank.ua/personal/statement/{WHITE_CARD_ID}/{from_time}/{to_time}"
-        headers = {"X-Token": MONO_TOKEN}
-        response = requests.get(url, headers=headers)
-
-        if response.status_code != 200:
-            return f"❌ Помилка Монобанку: {response.status_code}"
-
-        transactions = response.json()
-        if isinstance(transactions, dict) and "errorDescription" in transactions:
-            return f"❌ Банк відповів: {transactions['errorDescription']}"
-
-        total_spent = 0
-        categories_sum = {}
-
-        # 2. Обробка КАРТКИ
-        for item in transactions:
-            amount = item.get('amount', 0)
-            if amount < 0:
-                spent_uah = abs(amount) / 100
-                total_spent += spent_uah
-                mcc = item.get('mcc')
-                description = item.get('description', '')
-
-                # ВИКОРИСТОВУЄМО ПЕРЕХОПЛЮВАЧ:
-                category_name = get_category_for_mono(mcc, description)
-                categories_sum[category_name] = categories_sum.get(category_name, 0) + spent_uah
-
-        # 3. Обробка ГОТІВКИ (за сьогодні)
-        cash_transactions = load_cash_transactions_for_today()
-        cash_total = 0
-        for item in cash_transactions:
-            amount = item['amount']
-            cat_name = item['category']
-
-            cash_total += amount
-            total_spent += amount
-
-            display_name = f"💵 {cat_name} (Готівка)"
-            categories_sum[display_name] = categories_sum.get(display_name, 0) + amount
-
-        # 4. Формування тексту
-        if total_spent == 0:
-            return "🌙 <b>Підсумки дня:</b>\nСьогодні не було витрат! Ідеальний день для бюджету 💰"
-
-        message = f"🌙 <b>Підсумки дня:</b>\n"
-        message += f"💳 Картка: {total_spent - cash_total:.2f} грн\n"
-        message += f"💵 Готівка: {cash_total:.2f} грн\n"
-        message += f"💰 <b>ВСЬОГО ЗА СЬОГОДНІ:</b> {total_spent:.2f} грн\n\n"
-
-        sorted_cats = sorted(categories_sum.items(), key=lambda x: x[1], reverse=True)
-        for cat, summ in sorted_cats:
-            message += f"▪️ {cat}: {summ:.2f} грн\n"
-
-        return message
-
-    except Exception as e:
-        return f"❌ Помилка в денному звіті: {str(e)}"
-
-
-# --- ОБРОБКА ТРАНЗАКЦІЇ МОНОБАНКУ ---
-def process_mono_background(data):
+    category = categorize_cash(description)
+    date_str = datetime.now(KYIV_TZ).strftime(DATE_FMT)
     try:
-        item = data['data']['statementItem']
-        tx_id = item.get('id')
-
-        if tx_id in PROCESSED_TX:
-            return
-
-        PROCESSED_TX.add(tx_id)
-        if len(PROCESSED_TX) > 1000:
-            PROCESSED_TX.clear()
-
-        amount = item.get('amount', 0)
-        description = item.get('description', 'Неизвестно')
-        balance_uah = item.get('balance', 0) / 100
-
-        # Якщо сума від'ємна — це витрата
-        if amount < 0:
-            spent_uah = abs(amount) / 100
-            balance_uah = item.get('balance', 0) / 100
-            description = item.get('description', 'Невідомо')
-            mcc = item.get('mcc')
-
-            # ВИКОРИСТОВУЄМО ПЕРЕХОПЛЮВАЧ:
-            category_name = get_category_for_mono(mcc, description)
-
-            # 1. Беремо точний час транзакції з Монобанку і конвертуємо в Київський час
-            tx_time = item.get('time')
-            if tx_time:
-                date_str = datetime.fromtimestamp(tx_time, tz=KYIV_TZ).strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                date_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-            # 2. Записуємо в таблицю всі 5 параметрів (включно з категорією)
-            if sheet is not None:
-                sheet.append_row([date_str, spent_uah, description, "Карта", category_name])
-
-            # 3. Надсилаємо повідомлення
-            message = (
-                f"💸 <b>Нова витрата:</b> {spent_uah:.2f} грн\n"
-                f"🏷 <b>Категорія:</b> {category_name}\n"
-                f"📝 <b>Деталі:</b> {description}\n"
-                f"🏦 <b>Залишок:</b> {balance_uah:.2f} грн"
-            )
-            send_to_telegram(message)
-
-        # 2. НАДХОДЖЕННЯ (сума додатна)
-        elif amount > 0:
-            income_uah = amount / 100
-
-            if sheet is not None:
-                now = datetime.now()
-                date_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-                # Читаємо поточні дані, щоб знайти вільний рядок або заповнити колонки G, H, I
-                # Використовуємо метод update для конкретних стовпців G (7), H (8), I (9)
-                # Або простіший шпаргалковий метод через виправлення рядків,
-                # проте найпростіший спосіб для gspread додавати в кінець таблиці з урахуванням колонок:
-
-                # Отримуємо всі рядки, щоб знайти наступний вільний для колонок G-I
-                all_rows = sheet.get_all_values()
-                next_row = len(all_rows) + 1
-
-                # Записуємо точково в колонки G, H, I (7, 8, 9)
-                sheet.update_cell(next_row, 7, date_str)  # G: Дата
-                sheet.update_cell(next_row, 8, income_uah)  # H: Сума
-                sheet.update_cell(next_row, 9, description)  # I: Опис
-
-            message = (
-                f"💰 <b>Надходження (Зарплата/Переказ):</b> +{income_uah:.2f} грн\n"
-                f"📝 <b>Детали:</b> {description}\n"
-                f"🏦 <b>Остаток:</b> {balance_uah:.2f} грн"
-            )
-            send_to_telegram(message)
-
+        append_row(expenses_sheet(), [date_str, amount, description, TYPE_CASH, category])
     except Exception as e:
-        print(f"Помилка при обробці транзакції Монобанку: {e}")
+        send_to_telegram(f"❌ Не вдалося записати в таблицю: {esc(e)}", chat_id)
+        raise
 
-# --- головна сторінка для статусу 200 ---
-@app.route('/', methods=['GET'])
+    send_to_telegram(f"✅ Записано: {amount:.2f} грн ({esc(category)}) — {esc(description)}", chat_id)
+
+
+HELP_TEXT = (
+    "🤖 <b>Команди:</b>\n"
+    "/today — витрати за сьогодні\n"
+    "/stats — витрати за місяць\n"
+    "/cash 100 продукти — записати готівку"
+)
+
+
+# =====================================================================
+# ВЕБХУКИ
+# =====================================================================
+def secrets_equal(a, b):
+    return bool(b) and hmac.compare_digest(str(a or ""), str(b))
+
+
+@app.route("/", methods=["GET"])
 def home():
     return "Bot is alive and working!", 200
 
-# --- ВЕБХУК ДЛЯ МОНОБАНКУ (GET + POST) ---
-@app.route('/mono-webhook', methods=['GET', 'POST'])
-def mono_webhook():
-    if request.method == 'GET':
-        return "OK", 200
 
-    data = request.json
-    if data and data.get('type') == 'StatementItem':
-        thread = threading.Thread(target=process_mono_background, args=(data,))
-        thread.start()
+@app.route("/mono-webhook/<secret>", methods=["GET", "POST"])
+def mono_webhook(secret):
+    if not secrets_equal(secret, MONO_WEBHOOK_SECRET):
+        abort(404)
+    if request.method == "GET":
+        return "OK", 200  # Монобанк перевіряє адресу GET-запитом
 
+    data = request.get_json(silent=True) or {}
+    if data.get("type") == "StatementItem":
+        run_in_background(process_mono_transaction, data)
     return "OK", 200
 
 
-# --- ВЕБХУК ДЛЯ ТЕЛЕГРАМУ ---
-@app.route(f'/tg-{BOT_TOKEN}', methods=['POST'])
+@app.route("/tg-webhook", methods=["POST"])
 def telegram_webhook():
-    data = request.json
+    if not secrets_equal(request.headers.get("X-Telegram-Bot-Api-Secret-Token"), TG_SECRET):
+        abort(403)
 
-    if "message" in data and "text" in data["message"]:
-        text = data["message"]["text"]
-        chat_id = data["message"]["chat"]["id"]
+    data = request.get_json(silent=True) or {}
+    message = data.get("message") or {}
+    text = (message.get("text") or "").strip()
+    chat_id = str((message.get("chat") or {}).get("id", ""))
 
-        if text == "/stats":
-            thread = threading.Thread(target=process_stats_background, args=(chat_id,))
-            thread.start()
+    if not text or chat_id != CHAT_ID:
+        return "OK", 200  # ігноруємо чужих
 
-        elif text.startswith("/cash"):
-            try:
-                parts = text.split(maxsplit=2)
-                amount = parts[1]
-                description = parts[2] if len(parts) > 2 else "Без опису"
+    command, _, args = text.partition(" ")
+    command = command.split("@")[0].lower()  # /stats@MyBot -> /stats
 
-                save_cash_transaction(amount, description)
-                category = categorize_cash(description)
-                send_to_telegram(f"✅ Записано: {amount} грн ({category}) на '{description}'", chat_id)
-            except Exception as e:
-                send_to_telegram("❌ Помилка! Пиши так: <code>/cash 100 продукти</code>", chat_id)
-                print(f"Помилка збереження готівки: {e}")
+    if command == "/stats":
+        run_in_background(send_stats, "month", chat_id)
+    elif command == "/today":
+        run_in_background(send_stats, "today", chat_id)
+    elif command == "/cash":
+        run_in_background(handle_cash, args, chat_id)
+    elif command in ("/start", "/help"):
+        send_to_telegram(HELP_TEXT, chat_id)
 
     return "OK", 200
 
 
-# --- ВНУТРІШНІЙ БУДИЛЬНИК ---
-def scheduled_daily():
-    ADMIN_CHAT_ID = "912719804" # Твій ID
-    msg = get_daily_stats()
-    send_to_telegram(msg, ADMIN_CHAT_ID)
-
-def scheduled_monthly():
-    ADMIN_CHAT_ID = "912719804" # Твій ID
-    msg = get_monthly_stats()
-    header = "🏆 <b>ФІНАЛЬНИЙ ЗВІТ ЗА МІСЯЦЬ!</b> 🏆\n\n"
-    send_to_telegram(header + msg, ADMIN_CHAT_ID)
-
-# Налаштовуємо планувальник з Київським часом
-scheduler = BackgroundScheduler(timezone=KYIV_TZ)
-
-# Запускаємо денний звіт щодня о 23:55
-scheduler.add_job(scheduled_daily, CronTrigger(hour=23, minute=55))
-
-# Запускаємо місячний звіт в останній день місяця о 23:50
-scheduler.add_job(scheduled_monthly, CronTrigger(day='last', hour=23, minute=50))
-
-# Старт будильника
-scheduler.start()
+# Запасний шлях для зовнішнього крону (наприклад, cron-job.org),
+# якщо безкоштовний Render «заснув» і внутрішній планувальник не спрацював.
+@app.route("/cron/<job>", methods=["GET", "POST"])
+def cron(job):
+    if not secrets_equal(request.args.get("key"), CRON_SECRET):
+        abort(403)
+    if job == "daily":
+        run_in_background(send_stats, "today")
+    elif job == "monthly":
+        run_in_background(send_stats, "prev_month")
+    else:
+        abort(404)
+    return "OK", 200
 
 
-if __name__ == '__main__':
+# =====================================================================
+# ПЛАНУВАЛЬНИК
+# =====================================================================
+# Увага: при gunicorn з кількома воркерами планувальник стартує в кожному.
+# Запускайте з -w 1 або вимкніть його (ENABLE_SCHEDULER=False) і використовуйте /cron.
+if ENABLE_SCHEDULER:
+    scheduler = BackgroundScheduler(timezone=KYIV_TZ)
+    scheduler.add_job(send_stats, CronTrigger(hour=23, minute=55), args=["today"])
+    # Звіт за минулий місяць 1-го числа, щоб не губити останні хвилини місяця
+    scheduler.add_job(send_stats, CronTrigger(day=1, hour=0, minute=5), args=["prev_month"])
+    scheduler.start()
+
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)
