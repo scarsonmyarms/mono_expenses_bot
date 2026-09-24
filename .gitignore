@@ -2,3 +2,4 @@
 __pycache__/
 google_keys.json
 .venv
+dump.json

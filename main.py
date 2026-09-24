@@ -3,6 +3,7 @@ import html
 import json
 import math
 import os
+import re
 import threading
 import time
 import traceback
@@ -45,6 +46,18 @@ TYPE_CARD = "Карта"
 TYPE_CASH = "Готівка"
 SAVINGS_CATEGORY = "Накопичення"
 
+# Типи записів на аркуші "Надходження"
+INCOME_TYPE_INCOME = "Надходження"
+JAR_AUTO = "Автонакопичення"          # опис = назва банки, напр. "На щось"
+JAR_TOPUP = "Поповнення банки"        # "Поповнення «На квартиру»"
+JAR_ROUNDING = "Округлення балансу"   # "Округлення балансу «На щось»"
+JAR_WITHDRAWAL = "Зняття з банки"     # "Часткове зняття банки «…»", "Виплата банки «…»"
+
+# Чи надсилати в Telegram кожне дрібне автонакопичення й округлення.
+# Їх буває 5–10 на день, тому за замовчуванням вони пишуться в таблицю мовчки,
+# а сума видно в денному звіті.
+NOTIFY_AUTO_SAVINGS = config("NOTIFY_AUTO_SAVINGS", default=False, cast=bool)
+
 MONTHS_UK = ["січень", "лютий", "березень", "квітень", "травень", "червень",
              "липень", "серпень", "вересень", "жовтень", "листопад", "грудень"]
 
@@ -60,7 +73,6 @@ FUEL_KEYWORDS = ("окко", "okko", "ukrnafta", "укрнафта", "upg", "wog
 MONO_RULES = [
     (("любомир л",), "Комунальні послуги"),
     (("олександр б",), "Орендна плата"),
-    (("банки", "на банку"), SAVINGS_CATEGORY),
     (FUEL_KEYWORDS, "Бензин"),
 ]
 
@@ -107,7 +119,39 @@ def categorize_cash(description):
     return match_rules(description, CASH_RULES) or "Інше"
 
 
+JAR_NAME_RE = re.compile(r"«(.+?)»")
+
+
+def classify_jar_operation(amount, description):
+    """
+    Визначає операцію з банкою за описом.
+    Повертає (тип, назва_банки) або (None, None), якщо це не операція з банкою.
+    """
+    desc = (description or "").strip()
+    low = desc.lower()
+    quoted = JAR_NAME_RE.search(desc)
+    jar_name = quoted.group(1) if quoted else desc
+
+    if amount < 0:
+        if low.startswith("поповнення «"):
+            return JAR_TOPUP, jar_name
+        if low.startswith("округлення балансу «"):
+            return JAR_ROUNDING, jar_name
+        if low.startswith("на "):
+            return JAR_AUTO, jar_name
+    elif amount > 0:
+        if "зняття банки «" in low or "виплата банки «" in low:
+            return JAR_WITHDRAWAL, jar_name
+    return None, None
+
+
+def is_savings_transfer(description):
+    return classify_jar_operation(-1, description)[0] is not None
+
+
 def categorize_mono(mcc, description):
+    if is_savings_transfer(description):
+        return SAVINGS_CATEGORY
     return (match_rules(description, MONO_RULES)
             or MCC_DATASET.get(mcc)
             or f"❓ MCC: {mcc}")
@@ -140,8 +184,8 @@ def income_sheet():
     try:
         return ss.worksheet(INCOME_SHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=INCOME_SHEET_NAME, rows=1000, cols=3)
-        ws.append_row(["Дата", "Сума", "Опис"])
+        ws = ss.add_worksheet(title=INCOME_SHEET_NAME, rows=1000, cols=5)
+        ws.append_row(["Дата", "Сума", "Опис", "Тип", "Банка"])
         return ws
 
 
@@ -265,12 +309,17 @@ def build_stats(kind):
     start, end = period_bounds(kind)
     transactions = fetch_statement(int(start.timestamp()), int(end.timestamp()))
 
-    card_total = savings_total = cash_total = 0.0
+    card_total = savings_total = withdrawn_total = cash_total = 0.0
     categories = {}
 
     for item in transactions:
         amount = item.get("amount", 0)
-        if amount >= 0:
+        if amount > 0:
+            jar_type, _ = classify_jar_operation(amount, item.get("description", ""))
+            if jar_type == JAR_WITHDRAWAL:
+                withdrawn_total += amount / 100
+            continue
+        if amount == 0:
             continue
         spent = abs(amount) / 100
         category = categorize_mono(item.get("mcc"), item.get("description", ""))
@@ -294,7 +343,7 @@ def build_stats(kind):
     else:
         title = f"🏆 <b>ФІНАЛЬНИЙ ЗВІТ: {MONTHS_UK[start.month - 1]} {start.year}</b> 🏆"
 
-    if total == 0 and savings_total == 0:
+    if total == 0 and savings_total == 0 and withdrawn_total == 0:
         return f"{title}\nВитрат не зафіксовано 💰"
 
     lines = [
@@ -305,6 +354,8 @@ def build_stats(kind):
     ]
     if savings_total:
         lines.append(f"🐷 Відкладено в банки: {savings_total:.2f} грн")
+    if withdrawn_total:
+        lines.append(f"🔓 Знято з банок: {withdrawn_total:.2f} грн")
 
     if categories:
         lines.append("\n<b>Деталізація:</b>")
@@ -361,7 +412,29 @@ def process_mono_transaction(data):
 
     sheet_warning = ""
 
-    if amount < 0:
+    jar_type, jar_name = classify_jar_operation(amount, description)
+
+    if jar_type is not None:
+        # Операція з банкою: пишемо на аркуш "Надходження", не у витрати
+        value = abs(amount) / 100
+        try:
+            append_row(income_sheet(), [date_str, value, description, jar_type, jar_name])
+        except Exception as e:
+            print(f"Не вдалося записати операцію з банкою: {e}")
+            sheet_warning = "\n⚠️ Не вдалося записати в таблицю"
+
+        is_minor = jar_type in (JAR_AUTO, JAR_ROUNDING)
+        if not is_minor or NOTIFY_AUTO_SAVINGS or sheet_warning:
+            icon = "🔓" if jar_type == JAR_WITHDRAWAL else "🐷"
+            sign = "+" if jar_type == JAR_WITHDRAWAL else ""
+            send_to_telegram(
+                f"{icon} <b>{jar_type}:</b> {sign}{value:.2f} грн\n"
+                f"🫙 <b>Банка:</b> {esc(jar_name)}\n"
+                f"🏦 <b>Залишок на картці:</b> {balance:.2f} грн"
+                f"{sheet_warning}"
+            )
+
+    elif amount < 0:
         spent = abs(amount) / 100
         category = categorize_mono(item.get("mcc"), description)
         try:
@@ -381,7 +454,7 @@ def process_mono_transaction(data):
     elif amount > 0:
         income = amount / 100
         try:
-            append_row(income_sheet(), [date_str, income, description])
+            append_row(income_sheet(), [date_str, income, description, INCOME_TYPE_INCOME])
         except Exception as e:
             print(f"Не вдалося записати надходження: {e}")
             sheet_warning = "\n⚠️ Не вдалося записати в таблицю"
