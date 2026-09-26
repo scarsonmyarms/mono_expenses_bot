@@ -15,7 +15,7 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from decouple import config
-from flask import Flask, abort, request
+from flask import Flask, abort, jsonify, request
 
 # --- ЧАСОВИЙ ПОЯС ---
 try:
@@ -34,6 +34,7 @@ WHITE_CARD_ID = config("WHITE_CARD_ID")
 TG_SECRET = config("TG_SECRET")                    # перевіряється в заголовку від Telegram
 MONO_WEBHOOK_SECRET = config("MONO_WEBHOOK_SECRET")  # частина URL вебхука Монобанку
 CRON_SECRET = config("CRON_SECRET", default="")    # для зовнішнього крону (необов'язково)
+CASH_API_KEY = config("CASH_API_KEY", default="")  # для запису готівки з iPhone (Команди)
 
 ENABLE_SCHEDULER = config("ENABLE_SCHEDULER", default=True, cast=bool)
 GOOGLE_KEYS_FILE = config("GOOGLE_KEYS_FILE", default="google_keys.json")
@@ -52,6 +53,10 @@ JAR_AUTO = "Автонакопичення"          # опис = назва б�
 JAR_TOPUP = "Поповнення банки"        # "Поповнення «На квартиру»"
 JAR_ROUNDING = "Округлення балансу"   # "Округлення балансу «На щось»"
 JAR_WITHDRAWAL = "Зняття з банки"     # "Часткове зняття банки «…»", "Виплата банки «…»"
+OWN_TRANSFER = "Переказ на свою картку"
+
+# Точні описи переказів на власні картки (порівняння без урахування регістру)
+OWN_TRANSFER_DESCRIPTIONS = ("переказ на картку",)
 
 # Чи надсилати в Telegram кожне дрібне автонакопичення й округлення.
 # Їх буває 5–10 на день, тому за замовчуванням вони пишуться в таблицю мовчки,
@@ -133,6 +138,8 @@ def classify_jar_operation(amount, description):
     jar_name = quoted.group(1) if quoted else desc
 
     if amount < 0:
+        if low in OWN_TRANSFER_DESCRIPTIONS:
+            return OWN_TRANSFER, ""
         if low.startswith("поповнення «"):
             return JAR_TOPUP, jar_name
         if low.startswith("округлення балансу «"):
@@ -146,7 +153,9 @@ def classify_jar_operation(amount, description):
 
 
 def is_savings_transfer(description):
-    return classify_jar_operation(-1, description)[0] is not None
+    jar_type = classify_jar_operation(-1, description)[0]
+    return jar_type is not None and jar_type != OWN_TRANSFER
+
 
 
 def categorize_mono(mcc, description):
@@ -309,7 +318,7 @@ def build_stats(kind):
     start, end = period_bounds(kind)
     transactions = fetch_statement(int(start.timestamp()), int(end.timestamp()))
 
-    card_total = savings_total = withdrawn_total = cash_total = 0.0
+    card_total = savings_total = withdrawn_total = own_transfer_total = cash_total = 0.0
     categories = {}
 
     for item in transactions:
@@ -322,6 +331,9 @@ def build_stats(kind):
         if amount == 0:
             continue
         spent = abs(amount) / 100
+        if classify_jar_operation(amount, item.get("description", ""))[0] == OWN_TRANSFER:
+            own_transfer_total += spent  # гроші лишаються у вас
+            continue
         category = categorize_mono(item.get("mcc"), item.get("description", ""))
         if category == SAVINGS_CATEGORY:
             savings_total += spent  # накопичення не вважаємо витратами
@@ -343,7 +355,7 @@ def build_stats(kind):
     else:
         title = f"🏆 <b>ФІНАЛЬНИЙ ЗВІТ: {MONTHS_UK[start.month - 1]} {start.year}</b> 🏆"
 
-    if total == 0 and savings_total == 0 and withdrawn_total == 0:
+    if total == 0 and not (savings_total or withdrawn_total or own_transfer_total):
         return f"{title}\nВитрат не зафіксовано 💰"
 
     lines = [
@@ -356,6 +368,8 @@ def build_stats(kind):
         lines.append(f"🐷 Відкладено в банки: {savings_total:.2f} грн")
     if withdrawn_total:
         lines.append(f"🔓 Знято з банок: {withdrawn_total:.2f} грн")
+    if own_transfer_total:
+        lines.append(f"🔁 Переказано на свої картки: {own_transfer_total:.2f} грн")
 
     if categories:
         lines.append("\n<b>Деталізація:</b>")
@@ -415,21 +429,22 @@ def process_mono_transaction(data):
     jar_type, jar_name = classify_jar_operation(amount, description)
 
     if jar_type is not None:
-        # Операція з банкою: пишемо на аркуш "Надходження", не у витрати
+        # Операція з банкою чи переказ на свою картку: аркуш "Надходження", не витрати
         value = abs(amount) / 100
         try:
             append_row(income_sheet(), [date_str, value, description, jar_type, jar_name])
         except Exception as e:
-            print(f"Не вдалося записати операцію з банкою: {e}")
+            print(f"Не вдалося записати внутрішню операцію: {e}")
             sheet_warning = "\n⚠️ Не вдалося записати в таблицю"
 
         is_minor = jar_type in (JAR_AUTO, JAR_ROUNDING)
         if not is_minor or NOTIFY_AUTO_SAVINGS or sheet_warning:
-            icon = "🔓" if jar_type == JAR_WITHDRAWAL else "🐷"
+            icon = {JAR_WITHDRAWAL: "🔓", OWN_TRANSFER: "🔁"}.get(jar_type, "🐷")
             sign = "+" if jar_type == JAR_WITHDRAWAL else ""
+            jar_line = f"🫙 <b>Банка:</b> {esc(jar_name)}\n" if jar_name else ""
             send_to_telegram(
                 f"{icon} <b>{jar_type}:</b> {sign}{value:.2f} грн\n"
-                f"🫙 <b>Банка:</b> {esc(jar_name)}\n"
+                f"{jar_line}"
                 f"🏦 <b>Залишок на картці:</b> {balance:.2f} грн"
                 f"{sheet_warning}"
             )
@@ -481,6 +496,14 @@ def parse_cash_args(args):
     return round(amount, 2), description
 
 
+def record_cash(amount, description, category=None):
+    """Записує готівкову витрату в таблицю. Повертає категорію."""
+    category = (category or "").strip()[:50] or categorize_cash(description)
+    date_str = datetime.now(KYIV_TZ).strftime(DATE_FMT)
+    append_row(expenses_sheet(), [date_str, amount, description, TYPE_CASH, category])
+    return category
+
+
 def handle_cash(args, chat_id):
     try:
         amount, description = parse_cash_args(args)
@@ -488,10 +511,8 @@ def handle_cash(args, chat_id):
         send_to_telegram("❌ Пиши так: <code>/cash 100 продукти</code>", chat_id)
         return
 
-    category = categorize_cash(description)
-    date_str = datetime.now(KYIV_TZ).strftime(DATE_FMT)
     try:
-        append_row(expenses_sheet(), [date_str, amount, description, TYPE_CASH, category])
+        category = record_cash(amount, description)
     except Exception as e:
         send_to_telegram(f"❌ Не вдалося записати в таблицю: {esc(e)}", chat_id)
         raise
@@ -558,6 +579,40 @@ def telegram_webhook():
         send_to_telegram(HELP_TEXT, chat_id)
 
     return "OK", 200
+
+
+# Запис готівки з iPhone (застосунок «Команди»).
+# POST JSON: {"amount": 150, "description": "кава", "category": "Кафе. Ресторани"}
+# Заголовок: X-Api-Key: <CASH_API_KEY>. Поле category необов'язкове.
+@app.route("/api/cash", methods=["GET", "POST"])
+def api_cash():
+    # Завжди відповідаємо JSON, щоб «Команди» могли показати зрозуміле повідомлення
+    if request.method != "POST":
+        return jsonify(ok=False, message="❌ Потрібен метод POST"), 405
+    if not CASH_API_KEY:
+        return jsonify(ok=False, message="❌ На сервері не задано CASH_API_KEY"), 500
+    if not secrets_equal(request.headers.get("X-Api-Key"), CASH_API_KEY):
+        return jsonify(ok=False, message="❌ Невірний ключ X-Api-Key"), 403
+
+    data = request.get_json(silent=True) or {}
+    amount_raw = str(data.get("amount", "")).strip()
+    description = str(data.get("description", "")).strip()[:200]
+    try:
+        amount, description = parse_cash_args(f"{amount_raw} {description}")
+    except ValueError:
+        return jsonify(ok=False, message="❌ Некоректна сума"), 400
+
+    try:
+        category = record_cash(amount, description, data.get("category"))
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify(ok=False, message=f"❌ Не вдалося записати: {e}"), 500
+
+    message = f"✅ {amount:.2f} грн — {category}"
+    run_in_background(send_to_telegram,
+                      f"📱 <b>Готівка з iPhone:</b> {amount:.2f} грн\n"
+                      f"🏷 {esc(category)} — {esc(description)}")
+    return jsonify(ok=True, message=message), 200
 
 
 # Запасний шлях для зовнішнього крону (наприклад, cron-job.org),
