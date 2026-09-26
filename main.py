@@ -485,15 +485,34 @@ def process_mono_transaction(data):
 # =====================================================================
 # ГОТІВКА
 # =====================================================================
+def parse_amount(value):
+    """
+    Розбирає суму з тексту чи числа: "150", "150,5", "1 500,00", "150 ₴", 150.5.
+    Пробіли всередині (зокрема нерозривні, як у форматуванні iOS) ігноруються.
+    """
+    if isinstance(value, bool):
+        raise ValueError("некоректна сума")
+    if isinstance(value, (int, float)):
+        amount = float(value)
+    else:
+        text = re.sub(r"[\s\u00a0\u202f]", "", str(value))
+        text = re.sub(r"(грн|uah|₴)$", "", text, flags=re.IGNORECASE)
+        text = text.replace(",", ".")
+        if not re.fullmatch(r"\d+(\.\d+)?", text):
+            raise ValueError("некоректна сума")
+        amount = float(text)
+    if not math.isfinite(amount) or amount <= 0 or amount > 1_000_000:
+        raise ValueError("некоректна сума")
+    return round(amount, 2)
+
+
 def parse_cash_args(args):
     parts = args.split(maxsplit=1)
     if not parts:
         raise ValueError("немає суми")
-    amount = float(parts[0].replace(",", "."))
-    if not math.isfinite(amount) or amount <= 0 or amount > 1_000_000:
-        raise ValueError("некоректна сума")
+    amount = parse_amount(parts[0])
     description = parts[1].strip() if len(parts) > 1 else "Без опису"
-    return round(amount, 2), description
+    return amount, description
 
 
 def record_cash(amount, description, category=None):
@@ -594,13 +613,18 @@ def api_cash():
     if not secrets_equal(request.headers.get("X-Api-Key"), CASH_API_KEY):
         return jsonify(ok=False, message="❌ Невірний ключ X-Api-Key"), 403
 
-    data = request.get_json(silent=True) or {}
-    amount_raw = str(data.get("amount", "")).strip()
-    description = str(data.get("description", "")).strip()[:200]
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        body = request.get_data(as_text=True)[:100]
+        return jsonify(ok=False, message=f"❌ Тіло запиту не JSON: {body!r}"), 400
+
+    amount_raw = data.get("amount", "")
+    description = str(data.get("description") or "").strip()[:200] or "Без опису"
     try:
-        amount, description = parse_cash_args(f"{amount_raw} {description}")
+        amount = parse_amount(amount_raw)
     except ValueError:
-        return jsonify(ok=False, message="❌ Некоректна сума"), 400
+        shown = str(amount_raw)[:50]
+        return jsonify(ok=False, message=f"❌ Некоректна сума: {shown!r}"), 400
 
     try:
         category = record_cash(amount, description, data.get("category"))
